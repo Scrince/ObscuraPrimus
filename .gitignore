@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.spec~
+release/
+.gnupg-release/
+assets/
+*.asc
+!docs/*pubkey.asc
+
+# Private keys and certificate bundles
+*.key
+*.pem
+*.pfx
+*.p12
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.private-key
+*private.key
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local smoke-test files
+.smoke/
+ObscuraPrimusData/
