@@ -1,0 +1,13 @@
+{
+  "schema": "obscuraprimus.regression-corpus.v1",
+  "groups": {
+    "known_good": [
+      "sample.bmp",
+      "sample.wav"
+    ],
+    "malformed": [],
+    "known_bad": [],
+    "oversized": []
+  },
+  "notes": "Add fixtures here with expected parser behavior before broad parser changes."
+}
