@@ -1,0 +1,45 @@
+# Changelog
+
+## 1.0.0 - 2026-07-04
+
+- Initial PySide6 desktop application.
+- Added BMP, PNG, and WAV file embedding/extraction.
+- Added zlib compression support.
+- Added AES-256-GCM password encryption with PBKDF2-HMAC-SHA256.
+- Added optional XChaCha20-Poly1305 support when available.
+- Added adaptive embedding mode and spread payload mode.
+- Added password-seeded pseudo-random carrier ordering.
+- Added separate stego key support for adaptive/spread carrier ordering.
+- Added payload density presets for stealth/balanced/maximum carrier use.
+- Added scrypt KDF support through built-in `hashlib.scrypt`.
+- Added encrypted metadata for password-protected payloads.
+- Added verify-after-embed support and password confirmation in the GUI.
+- Added in-memory verification path with no extracted temp file.
+- Added exact capacity calculation, payload checksums, and atomic extraction writes.
+- Added portable config/log files.
+- Added forensic scan mode for files/folders with sortable table results, risk scores, entropy/LSB indicators, generic LSB anomaly checks, cancellation, and CSV/JSON reports.
+- Added CLI support for embed, extract, capacity, and scan.
+- Added carrier codec registry and JPEG-DCT backend scaffold.
+- Added automated version bump/tag helper.
+- Added file analysis suite with magic-byte identification, hashing, entropy maps, hex preview/search, string and IOC extraction, metadata/archive/media/PE/script inspection, duplicate detection, timeline fields, and risk scoring.
+- Added Analysis GUI tab with evidence inventory table, scan profiles, YARA hook, reports, safe preview, case workspace, tags, and analyst notes.
+- Added case manifests, audit logs, CSV/JSON/HTML analysis reports, and optional GPG report signatures.
+- Added EXIF/GPS parsing and JPEG EXIF stripping.
+- Added PDF object/action/script/embed flags, Office relationships/external links/embedded object inspection, MSI/LNK/SQLite inspection, PE data-directory flags, ClamAV/VirusTotal hooks, known hash-set helpers, and generic file carving.
+- Added visualization data helpers for entropy charts, bit planes, LSB histograms, WAV waveform summaries, and spectrogram summaries.
+- Added job history, analyzer plugin registry, SQLite-backed case database, portable health checks, update checker, user manual, and installer template.
+- Added settings/about tab with high-contrast mode and default options.
+- Added tests for WAV, PNG, wrong passwords, encrypted metadata, scrypt/stego-key extraction, density presets, CLI, corrupted payloads, forensic scanning, JSON reports, malformed covers, file analysis, deep parsers, reports, case manifests/database, carving, compare, and oversized payloads.
+- Added PyInstaller single-executable release packaging.
+- Added Windows icon, version metadata, PGP detached signatures, GitHub release workflow, reproducible build notes, SBOM/license reports, and SHA-256 checksums.
+- Added FLAC carrier support through valid APPLICATION metadata blocks that preserve audio frame bytes.
+- Added JPEG DCT backend adapter contract through `OBSCURAPRIMUS_JPEG_DCT_BACKEND`.
+- Added Suite GUI tab and CLI tools for YARA details, Sigma validation, chart data, virtual hex pages, immutable evidence import, case search, RAW/browser/Windows artifacts, timelines, anomaly scoring, script deobfuscation, onboarding sample cases, and plugin SDK generation.
+- Added tests for FLAC round trips and advanced analysis workflows.
+- Added stronger case database schema with files, findings, IOCs, notes, tags, reports, chain-of-custody entries, timeline events, and FTS search.
+- Added findings workflow fields for status, severity, owner, false-positive state, and report inclusion state.
+- Added signed case export/import bundles.
+- Added formal analyzer plugin discovery, manifest validation, timeout execution, and reportable plugin findings.
+- Added interactive Suite chart widget, virtual hex paging widget, dashboard counts, shortcuts, and command field.
+- Added Authenticode checks through signtool/PowerShell when available, richer browser/Windows artifact summaries, carving preview, and additional deobfuscation helpers.
+- Added GUI smoke test and regression corpus manifest.
