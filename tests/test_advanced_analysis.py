@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -114,6 +115,19 @@ class AdvancedAnalysisTests(unittest.TestCase):
         write_example_plugin(plugins_root / "demo", "demo")
         self.assertEqual(discover_plugins(plugins_root)[0].name, "demo")
         self.assertEqual(run_matching_plugins(yara, plugins_root)[0]["plugin"], "demo")
+
+    def test_plugin_manifest_accepts_utf8_bom(self):
+        plugin_dir = self.root / "bom_plugin"
+        manifest = write_example_plugin(plugin_dir, "bom_demo")
+        (plugin_dir / "plugin.json").write_text(
+            "\ufeff" + json.dumps(manifest, indent=2),
+            encoding="utf-8",
+        )
+
+        plugins = discover_plugins(plugin_dir)
+
+        self.assertEqual(len(plugins), 1)
+        self.assertEqual(plugins[0].name, "bom_demo")
 
 
 if __name__ == "__main__":
