@@ -13,8 +13,10 @@ from .advanced_analysis import (
     carving_preview,
     deobfuscate_script,
     entropy_timeline,
+    export_case_bundle,
     export_timeline,
     fuzzy_hash,
+    import_case_bundle,
     import_immutable_evidence,
     inspect_browser_artifact,
     inspect_raw_image,
@@ -352,5 +354,3 @@ def _print_progress(value: int, message: str) -> None:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
-    export_case_bundle,
-    import_case_bundle,
