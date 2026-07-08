@@ -1,0 +1,9 @@
+*.asc -text
+dist/*.exe binary
+release/*.zip binary
+release/SHA256SUMS.txt -text
+release/SBOM.json -text
+release/DEPENDENCY_LICENSES.md -text
+release/ObscuraPrimus-*-windows-x64/*.exe binary
+release/ObscuraPrimus-*-windows-x64/SBOM.json -text
+release/ObscuraPrimus-*-windows-x64/DEPENDENCY_LICENSES.md -text
