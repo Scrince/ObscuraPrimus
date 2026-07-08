@@ -61,7 +61,7 @@ def discover_plugins(directory: str | Path | None = None) -> list[AnalyzerPlugin
 def validate_manifest(path: str | Path) -> dict:
     manifest_path = Path(path)
     try:
-        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        data = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         return {"valid": False, "error": str(exc), "manifest": {}}
     required = {"schema", "name", "version", "entry_point"}
