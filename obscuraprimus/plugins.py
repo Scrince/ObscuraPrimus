@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
+import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from concurrent.futures import TimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -80,10 +82,8 @@ def run_plugin(plugin: AnalyzerPlugin, path: str | Path, timeout: int = 30) -> d
     if not plugin.entry_point or not plugin.root:
         return {"plugin": plugin.name, "findings": [], "risk_delta": 0, "elapsed": 0}
     start = time.time()
-    executor = ThreadPoolExecutor(max_workers=1)
     try:
-        future = executor.submit(_run_plugin_inline, plugin, str(path))
-        result = future.result(timeout=timeout)
+        result = _run_plugin_subprocess(plugin, str(path), timeout)
         result.setdefault("plugin", plugin.name)
         result["elapsed"] = round(time.time() - start, 3)
         return result
@@ -91,8 +91,6 @@ def run_plugin(plugin: AnalyzerPlugin, path: str | Path, timeout: int = 30) -> d
         return {"plugin": plugin.name, "error": f"Plugin timed out after {timeout} seconds.", "findings": [], "risk_delta": 0}
     except Exception as exc:
         return {"plugin": plugin.name, "error": str(exc), "findings": [], "risk_delta": 0}
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def run_matching_plugins(path: str | Path, directory: str | Path | None = None, timeout: int = 30) -> list[dict]:
@@ -115,4 +113,53 @@ def _run_plugin_inline(plugin: AnalyzerPlugin, path: str) -> dict:
     result = module.analyze_file(path)
     if not isinstance(result, dict):
         raise ValueError("Plugin analyze_file(path) must return a dict.")
+    return result
+
+
+_PLUGIN_RUNNER_CODE = r"""
+import contextlib
+import importlib.util
+import json
+import pathlib
+import sys
+
+entry = pathlib.Path(sys.argv[1])
+target = sys.argv[2]
+spec = importlib.util.spec_from_file_location("obp_external_plugin", entry)
+if not spec or not spec.loader:
+    raise SystemExit("Unable to load plugin entry point.")
+module = importlib.util.module_from_spec(spec)
+with contextlib.redirect_stdout(sys.stderr):
+    spec.loader.exec_module(module)
+    if not hasattr(module, "analyze_file"):
+        raise SystemExit("Plugin does not expose analyze_file(path).")
+    result = module.analyze_file(target)
+if not isinstance(result, dict):
+    raise SystemExit("Plugin analyze_file(path) must return a dict.")
+print(json.dumps(result, sort_keys=True))
+"""
+
+
+def _run_plugin_subprocess(plugin: AnalyzerPlugin, path: str, timeout: int) -> dict:
+    entry = Path(plugin.root) / plugin.entry_point
+    if not entry.exists():
+        raise ValueError("Plugin entry point does not exist.")
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-I", "-c", _PLUGIN_RUNNER_CODE, str(entry), path],
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError from exc
+    if completed.returncode:
+        raise ValueError((completed.stderr or completed.stdout or "Plugin subprocess failed.").strip())
+    try:
+        result = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Plugin subprocess returned invalid JSON.") from exc
+    if not isinstance(result, dict):
+        raise ValueError("Plugin subprocess result must be a JSON object.")
     return result

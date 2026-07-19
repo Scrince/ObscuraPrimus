@@ -40,3 +40,7 @@ Thumbs.db
 # Local smoke-test files
 .smoke/
 ObscuraPrimusData/
+
+# Windows shortcuts
+*.lnk
+

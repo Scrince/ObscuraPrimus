@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -47,10 +49,18 @@ from .file_analysis import (
 from .forensics import scan_path, write_report
 from .health import check_github_update, portable_health
 from .plugins import available_plugins
-from .stego_engine import EmbedOptions, embed_file, estimate_capacity, extract_file
+from .stego_engine import EmbedOptions, StegoError, embed_file, estimate_capacity, extract_file
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except StegoError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="obscuraprimus", description="Portable steganography toolkit")
     subcommands = parser.add_subparsers(dest="command", required=True)
 
@@ -58,7 +68,12 @@ def main(argv: list[str] | None = None) -> int:
     embed.add_argument("--cover", required=True)
     embed.add_argument("--secret", required=True)
     embed.add_argument("--out", required=True)
-    embed.add_argument("--password", default="")
+    
+    embed.add_argument(
+        "--password-env",
+        default="OBSCURAPRIMUS_PASSWORD",
+        help="Environment variable for password when non-interactive (default: OBSCURAPRIMUS_PASSWORD)",
+    )
     embed.add_argument("--stego-key", default="")
     embed.add_argument("--encryption", choices=["None", "AES-256-GCM", "XChaCha20-Poly1305"], default="None")
     embed.add_argument("--kdf", choices=["PBKDF2-HMAC-SHA256", "scrypt"], default="PBKDF2-HMAC-SHA256")
@@ -71,7 +86,11 @@ def main(argv: list[str] | None = None) -> int:
     extract = subcommands.add_parser("extract", help="Extract a hidden file from a cover")
     extract.add_argument("--cover", required=True)
     extract.add_argument("--out", required=True)
-    extract.add_argument("--password", default="")
+    extract.add_argument(
+        "--password-env",
+        default="OBSCURAPRIMUS_PASSWORD",
+        help="Environment variable for password when non-interactive (default: OBSCURAPRIMUS_PASSWORD)",
+    )
     extract.add_argument("--stego-key", default="")
 
     capacity = subcommands.add_parser("capacity", help="Show exact carrier capacity")
@@ -82,7 +101,11 @@ def main(argv: list[str] | None = None) -> int:
 
     scan = subcommands.add_parser("scan", help="Forensic scan files or folders")
     scan.add_argument("target")
-    scan.add_argument("--password", default="")
+    scan.add_argument(
+        "--password-env",
+        default="OBSCURAPRIMUS_PASSWORD",
+        help="Environment variable for password when non-interactive (default: OBSCURAPRIMUS_PASSWORD)",
+    )
     scan.add_argument("--stego-key", default="")
     scan.add_argument("--no-recursive", action="store_true")
     scan.add_argument("--csv", default="")
@@ -174,7 +197,37 @@ def main(argv: list[str] | None = None) -> int:
     sdk.add_argument("--name", default="example_plugin")
 
     args = parser.parse_args(argv)
+
+    def resolve_password(required: bool) -> str:
+        
+        env_name = getattr(args, "password_env", "OBSCURAPRIMUS_PASSWORD") or "OBSCURAPRIMUS_PASSWORD"
+        from_env = os.environ.get(env_name, "")
+        if from_env:
+            return from_env
+        if not required and args.command == "scan":
+            
+            if sys.stdin.isatty():
+                try:
+                    return getpass.getpass("Password (leave empty if none): ")
+                except (EOFError, KeyboardInterrupt):
+                    return ""
+            return ""
+        if not sys.stdin.isatty():
+            raise SystemExit(
+                f"Error: password required but stdin is not a TTY. "
+                f"Set the {env_name} environment variable for non-interactive use."
+            )
+        try:
+            return getpass.getpass("Password: ")
+        except (EOFError, KeyboardInterrupt) as exc:
+            raise SystemExit("Error: password entry cancelled.") from exc
+
     if args.command == "embed":
+        password = ""
+        if args.encryption != "None":
+            password = resolve_password(required=True)
+            if not password:
+                raise SystemExit("Error: a password is required when encryption is enabled.")
         embed_file(
             args.cover,
             args.secret,
@@ -182,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
             EmbedOptions(
                 compress=not args.no_compress,
                 encryption=args.encryption,
-                password=args.password,
+                password=password,
                 adaptive=args.adaptive,
                 spread=args.spread,
                 verify_after_embed=args.verify,
@@ -195,13 +248,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "extract":
         out = Path(args.out)
-        extract_file(args.cover, str(out.parent), args.password, out.name, args.stego_key, _print_progress)
+        password = resolve_password(required=True)
+        extract_file(args.cover, str(out.parent), password, out.name, args.stego_key, _print_progress)
         return 0
     if args.command == "capacity":
         print(estimate_capacity(args.cover, args.adaptive, args.spread, args.density))
         return 0
     if args.command == "scan":
-        findings = scan_path(args.target, args.password, recursive=not args.no_recursive, stego_key=args.stego_key)
+        password = resolve_password(required=False)
+        findings = scan_path(args.target, password, recursive=not args.no_recursive, stego_key=args.stego_key)
         for finding in findings:
             print(f"{finding.status.upper():10} risk={finding.risk_score:3d} {finding.confidence:6} {finding.cover_type:4} {finding.path} - {finding.details}")
         if args.csv:

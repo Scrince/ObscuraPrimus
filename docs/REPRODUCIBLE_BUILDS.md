@@ -42,7 +42,15 @@ Outputs:
 powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1 -Version 1.0.0
 ```
 
-The release script uses GPG in the style of YellowSphere: detached ASCII-armored `.asc` signatures are generated for the executable, zip, and checksum manifest. If no release key exists, a local no-passphrase release key is created in `.gnupg-release` and the public key is exported to `docs\ObscuraPrimus_Release_Signing_2026_pubkey.asc`.
+The release script uses the centralized ObscuraPrimus PGP helper in `obscuraprimus.signing`: detached ASCII-armored `.asc` signatures are generated for the executable, zip, checksum manifest, SBOM, and dependency-license report. If no release key exists, a local no-passphrase release key is created in `.gnupg-release` and the matching public key is exported to `docs\ObscuraPrimus_Release_Signing_2026_pubkey.asc`.
+
+The same helper is available directly:
+
+```powershell
+python scripts\pgp_release.py ensure-key --public-key docs\ObscuraPrimus_Release_Signing_2026_pubkey.asc
+python scripts\pgp_release.py sign dist\ObscuraPrimus.exe release\SHA256SUMS.txt
+python scripts\pgp_release.py fingerprint
+```
 
 Verify the manifest:
 
@@ -53,7 +61,8 @@ gpg --verify release\SHA256SUMS.txt.asc release\SHA256SUMS.txt
 Current local release signing key fingerprint:
 
 ```text
-323D 123C BF92 E8C9 62AA A846 3B4C CEFE CA58 0B4D
+Primary: 323D 123C BF92 E8C9 62AA A846 3B4C CEFE CA58 0B4D
+Signing subkey: 72BC 06F0 86A2 87ED 6D65 6D4E 91D5 38D9 88C2 5318
 ```
 
 These PGP signatures provide release integrity. They do not replace Windows Authenticode publisher signing.

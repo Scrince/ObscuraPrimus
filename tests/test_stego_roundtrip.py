@@ -6,10 +6,11 @@ import tempfile
 import unittest
 import wave
 from pathlib import Path
+from unittest import mock
 
 from obscuraprimus.png_codec import PngImage, write_png
 from obscuraprimus.forensics import scan_path
-from obscuraprimus.stego_engine import PREFIX_SIZE, CapacityError, EmbedOptions, StegoError, embed_file, estimate_capacity, extract_file
+from obscuraprimus.stego_engine import PREFIX_SIZE, CapacityError, EmbedOptions, StegoError, UnsupportedCoverError, embed_file, estimate_capacity, extract_file
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
@@ -97,6 +98,23 @@ class StegoRoundTripTests(unittest.TestCase):
             extract_file(str(stego), str(self.root), password="wrong", output_name="bad.txt")
         self.assertFalse((self.root / "bad.txt").exists())
 
+    def test_wrong_password_without_adaptive_or_spread_raises_stego_error(self):
+        cover = FIXTURE_DIR / "sample.bmp"
+        secret = self.root / "secret.txt"
+        stego = self.root / "stego.bmp"
+        secret.write_text("private", encoding="utf-8")
+
+        embed_file(
+            str(cover),
+            str(secret),
+            str(stego),
+            EmbedOptions(encryption="AES-256-GCM", password="right", adaptive=False, spread=False),
+        )
+
+        with self.assertRaisesRegex(StegoError, "password may be wrong"):
+            extract_file(str(stego), str(self.root), password="wrong", output_name="bad.txt")
+        self.assertFalse((self.root / "bad.txt").exists())
+
     def test_encrypted_metadata_hides_filename_and_extracts_with_password(self):
         cover = FIXTURE_DIR / "sample.bmp"
         secret = self.root / "private-name.txt"
@@ -159,6 +177,45 @@ class StegoRoundTripTests(unittest.TestCase):
         extract_file(str(stego), str(self.root), output_name="density.txt")
         self.assertEqual((self.root / "density.txt").read_text(encoding="utf-8"), "density preset")
 
+    def test_embed_in_place_roundtrip(self):
+        cover = self.root / "cover.bmp"
+        secret = self.root / "secret.txt"
+        out = self.root / "out"
+        out.mkdir()
+        shutil.copyfile(FIXTURE_DIR / "sample.bmp", cover)
+        secret.write_text("in-place payload", encoding="utf-8")
+
+        embed_file(str(cover), str(secret), str(cover), EmbedOptions(compress=False))
+        extract_file(str(cover), str(out), output_name="recovered.txt")
+
+        self.assertEqual((out / "recovered.txt").read_text(encoding="utf-8"), "in-place payload")
+
+    def test_embed_replace_failure_preserves_existing_bmp_output(self):
+        cover = self.root / "cover.bmp"
+        secret = self.root / "secret.txt"
+        shutil.copyfile(FIXTURE_DIR / "sample.bmp", cover)
+        original = cover.read_bytes()
+        secret.write_text("private", encoding="utf-8")
+
+        with mock.patch("obscuraprimus.stego_engine.os.replace", side_effect=OSError("replace failed")):
+            with self.assertRaises(OSError):
+                embed_file(str(cover), str(secret), str(cover), EmbedOptions(compress=False))
+
+        self.assertEqual(cover.read_bytes(), original)
+
+    def test_embed_replace_failure_preserves_existing_wav_output(self):
+        cover = self.root / "cover.wav"
+        secret = self.root / "secret.txt"
+        shutil.copyfile(FIXTURE_DIR / "sample.wav", cover)
+        original = cover.read_bytes()
+        secret.write_text("private", encoding="utf-8")
+
+        with mock.patch("obscuraprimus.stego_engine.os.replace", side_effect=OSError("replace failed")):
+            with self.assertRaises(OSError):
+                embed_file(str(cover), str(secret), str(cover), EmbedOptions(compress=False))
+
+        self.assertEqual(cover.read_bytes(), original)
+
     def test_forensic_scan_finds_embedded_payload(self):
         cover = FIXTURE_DIR / "sample.bmp"
         secret = self.root / "secret.txt"
@@ -216,6 +273,38 @@ class StegoRoundTripTests(unittest.TestCase):
         )
         self.assertIn("CLEAN", scan.stdout)
 
+    def test_cli_wrong_password_prints_clean_error(self):
+        cover = FIXTURE_DIR / "sample.bmp"
+        secret = self.root / "secret.txt"
+        stego = self.root / "stego.bmp"
+        output = self.root / "bad.txt"
+        secret.write_text("private", encoding="utf-8")
+        embed_file(str(cover), str(secret), str(stego), EmbedOptions(encryption="AES-256-GCM", password="right"))
+
+        env = dict(**__import__("os").environ)
+        env["OBSCURAPRIMUS_PASSWORD"] = "wrong"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "obscuraprimus",
+                "extract",
+                "--cover",
+                str(stego),
+                "--out",
+                str(output),
+            ],
+            cwd=Path(__file__).parents[1],
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Error: Decryption failed.", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(output.exists())
+
     def test_corrupted_payload_fails_without_partial_output(self):
         cover = FIXTURE_DIR / "sample.bmp"
         secret = self.root / "secret.txt"
@@ -250,6 +339,20 @@ class StegoRoundTripTests(unittest.TestCase):
             embed_file(str(bad_bmp), str(secret), str(self.root / "out.bmp"), EmbedOptions())
         with self.assertRaises(Exception):
             embed_file(str(bad_png), str(secret), str(self.root / "out.png"), EmbedOptions())
+
+    def test_jpeg_without_backend_fails_with_specific_guidance(self):
+        cover = self.root / "cover.jpg"
+        secret = self.root / "secret.txt"
+        cover.write_bytes(b"\xff\xd8\xff\xdbpayload\xff\xd9")
+        secret.write_text("jpeg payload", encoding="utf-8")
+
+        with mock.patch.dict("os.environ", {"OBSCURAPRIMUS_JPEG_DCT_BACKEND": ""}, clear=False):
+            with self.assertRaisesRegex(UnsupportedCoverError, "JPEG-DCT carrier support is unavailable"):
+                estimate_capacity(str(cover))
+            with self.assertRaisesRegex(UnsupportedCoverError, "Use BMP, PNG, WAV, or FLAC"):
+                embed_file(str(cover), str(secret), str(self.root / "out.jpg"), EmbedOptions(compress=False))
+            with self.assertRaisesRegex(UnsupportedCoverError, "configure the JPEG backend"):
+                extract_file(str(cover), str(self.root), output_name="out.txt")
 
 
 def _write_bmp_cover(path: Path, width: int, height: int):

@@ -128,8 +128,16 @@ def scan_yara_details(target: str | Path, rule_path: str | Path) -> list[YaraMat
 
 
 def entropy_timeline(path: str | Path, block_size: int = 4096) -> list[dict]:
-    data = Path(path).read_bytes()
-    return [{"offset": offset, "entropy": entropy(data[offset : offset + block_size])} for offset in range(0, len(data), block_size)]
+    timeline = []
+    offset = 0
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(block_size)
+            if not chunk:
+                break
+            timeline.append({"offset": offset, "entropy": entropy(chunk)})
+            offset += len(chunk)
+    return timeline
 
 
 def byte_histogram(path: str | Path) -> list[int]:

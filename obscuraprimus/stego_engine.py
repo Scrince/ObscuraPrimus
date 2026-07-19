@@ -17,6 +17,8 @@ from .crypto import CryptoError, decrypt, encrypt
 from .flac_codec import embed_container as embed_flac_container, extract_container as extract_flac_container, metadata_capacity as flac_metadata_capacity
 from .jpeg_dct import (
     JpegDctError,
+    backend_available as jpeg_backend_available,
+    backend_unavailable_message as jpeg_backend_unavailable_message,
     capacity_with_backend as jpeg_capacity_with_backend,
     embed_with_backend as jpeg_embed_with_backend,
     extract_with_backend as jpeg_extract_with_backend,
@@ -139,6 +141,7 @@ def embed_file(
 
     container = _pack_container(metadata, payload)
     cover_type = _detect_cover_type(cover_path)
+    _ensure_cover_type_available(cover_type)
     _progress(progress, 25, f"Embedding into {cover_type.upper()} cover...")
 
     if cover_type == "bmp":
@@ -150,7 +153,14 @@ def embed_file(
     elif cover_type == "jpg":
         _embed_jpeg_dct(cover_path, output_path, container, options, progress)
     elif cover_type == "flac":
-        embed_flac_container(cover_path, output_path, container)
+        # FLAC stores the container in a discoverable APPLICATION metadata block
+        # (not LSB stego). Require AEAD encryption so the payload is not plaintext.
+        if options.encryption == "None" or not options.password:
+            raise StegoError(
+                "FLAC embedding requires encryption with a password. "
+                "The payload is stored in a visible APPLICATION metadata block."
+            )
+        _embed_flac(cover_path, output_path, container)
     else:
         raise UnsupportedCoverError("Unsupported cover file. Use BMP, PNG, or WAV.")
 
@@ -187,6 +197,7 @@ def extract_bytes(
     progress: ProgressCallback | None = None,
 ) -> ExtractionResult:
     cover_type = _detect_cover_type(cover_path)
+    _ensure_cover_type_available(cover_type)
     _progress(progress, 5, f"Scanning {cover_type.upper()} cover...")
 
     if cover_type == "bmp":
@@ -207,33 +218,50 @@ def extract_bytes(
 
     if metadata.get("encrypted"):
         _progress(progress, 75, f"Decrypting payload with {metadata.get('algorithm')}...")
-        payload = decrypt(
-            payload,
-            password,
-            metadata["algorithm"],
-            bytes.fromhex(metadata["salt"]),
-            bytes.fromhex(metadata["nonce"]),
-            int(metadata["iterations"]),
-            metadata.get("kdf", "PBKDF2-HMAC-SHA256"),
-            PAYLOAD_AAD if metadata.get("kdf") else None,
-        )
-        private_blob = metadata.get("private_metadata")
-        if private_blob:
-            private_data = decrypt(
-                bytes.fromhex(private_blob),
+        try:
+            payload = _decrypt_with_aad_fallback(
+                payload,
                 password,
                 metadata["algorithm"],
-                bytes.fromhex(metadata["private_salt"]),
-                bytes.fromhex(metadata["private_nonce"]),
-                int(metadata["private_iterations"]),
-                metadata.get("private_kdf", metadata.get("kdf", "PBKDF2-HMAC-SHA256")),
-                METADATA_AAD if metadata.get("private_kdf") else None,
+                bytes.fromhex(metadata["salt"]),
+                bytes.fromhex(metadata["nonce"]),
+                int(metadata["iterations"]),
+                metadata.get("kdf", "PBKDF2-HMAC-SHA256"),
+                primary_aad=PAYLOAD_AAD,
+                # Legacy containers may lack the kdf field and used aad=None.
+                allow_legacy_null_aad="kdf" not in metadata,
             )
+        except CryptoError as exc:
+            raise StegoError("Decryption failed. The password may be wrong or the payload is corrupted.") from exc
+        private_blob = metadata.get("private_metadata")
+        if private_blob:
+            try:
+                private_data = _decrypt_with_aad_fallback(
+                    bytes.fromhex(private_blob),
+                    password,
+                    metadata["algorithm"],
+                    bytes.fromhex(metadata["private_salt"]),
+                    bytes.fromhex(metadata["private_nonce"]),
+                    int(metadata["private_iterations"]),
+                    metadata.get("private_kdf", metadata.get("kdf", "PBKDF2-HMAC-SHA256")),
+                    primary_aad=METADATA_AAD,
+                    allow_legacy_null_aad="private_kdf" not in metadata and "kdf" not in metadata,
+                )
+            except CryptoError as exc:
+                raise StegoError("Decryption failed. The password may be wrong or the payload is corrupted.") from exc
             metadata.update(json.loads(private_data.decode("utf-8")))
 
     if metadata.get("compressed"):
         _progress(progress, 85, "Decompressing payload...")
-        payload = decompress_data(payload)
+        expected = metadata.get("original_size")
+        try:
+            expected_int = int(expected) if expected not in (None, "") else None
+        except (TypeError, ValueError):
+            expected_int = None
+        try:
+            payload = decompress_data(payload, expected_size=expected_int)
+        except ValueError as exc:
+            raise StegoError(str(exc)) from exc
 
     expected_hash = metadata.get("sha256")
     if expected_hash and _sha256_hex(payload) != expected_hash:
@@ -243,21 +271,31 @@ def extract_bytes(
     return ExtractionResult(filename=filename, data=payload, metadata=metadata)
 
 
+# Container format overhead: magic + u32 header length + typical min metadata JSON.
+# Reserved so capacity estimates match what embed can actually pack.
+_CONTAINER_FORMAT_OVERHEAD = len(MAGIC) + HEADER_LEN_SIZE + 256
+
+
 def estimate_capacity(cover_path: str, adaptive: bool = False, spread: bool = False, density: str = "maximum") -> int:
     cover_type = _detect_cover_type(cover_path)
+    _ensure_cover_type_available(cover_type)
     if cover_type == "bmp":
         carriers = _bmp_carrier_count(cover_path, adaptive, density)
+        raw_bytes = carriers // 8
     elif cover_type == "wav":
         carriers = _wav_carrier_count(cover_path, adaptive, density)
+        raw_bytes = carriers // 8
     elif cover_type == "png":
         carriers = _png_carrier_count(cover_path, adaptive, density)
+        raw_bytes = carriers // 8
     elif cover_type == "jpg":
-        return max(0, jpeg_capacity_with_backend(cover_path))
+        raw_bytes = max(0, jpeg_capacity_with_backend(cover_path))
     elif cover_type == "flac":
-        return max(0, flac_metadata_capacity(cover_path))
+        raw_bytes = max(0, flac_metadata_capacity(cover_path))
     else:
-        raise UnsupportedCoverError("Unsupported cover file. Use BMP, PNG, or WAV.")
-    return max(0, carriers // 8)
+        raise UnsupportedCoverError(_supported_cover_message())
+    # Subtract container framing so near-limit embeds do not over-promise.
+    return max(0, raw_bytes - _CONTAINER_FORMAT_OVERHEAD)
 
 
 def estimate_distortion(cover_path: str, payload_bytes: int, adaptive: bool = False, density: str = "maximum") -> dict:
@@ -269,6 +307,45 @@ def estimate_distortion(cover_path: str, payload_bytes: int, adaptive: bool = Fa
         "estimated_lsb_changes": changed,
         "estimated_change_ratio": 0.0 if carriers == 0 else changed / max(1, carriers * 8),
     }
+
+
+def _decrypt_with_aad_fallback(
+    ciphertext: bytes,
+    password: str,
+    algorithm: str,
+    salt: bytes,
+    nonce: bytes,
+    iterations: int,
+    kdf: str,
+    *,
+    primary_aad: bytes,
+    allow_legacy_null_aad: bool,
+) -> bytes:
+    """
+    Decrypt with versioned AAD. Current format always uses primary_aad.
+    Only when the container looks legacy (missing kdf fields) do we also try aad=None.
+    """
+    candidates: list[bytes | None] = [primary_aad]
+    if allow_legacy_null_aad:
+        candidates.append(None)
+    last_error: CryptoError | None = None
+    for aad in candidates:
+        try:
+            return decrypt(
+                ciphertext,
+                password,
+                algorithm,
+                salt,
+                nonce,
+                iterations,
+                kdf,
+                aad,
+            )
+        except CryptoError as exc:
+            last_error = exc
+            continue
+    assert last_error is not None
+    raise last_error
 
 
 def _pack_container(metadata: dict, payload: bytes) -> bytes:
@@ -301,7 +378,7 @@ def _embed_bmp(
     data = bytearray(Path(cover_path).read_bytes())
     pixel_offset = _bmp_pixel_offset(data)
     _write_bits(data, pixel_offset, len(data), container, options, progress, 25, 92)
-    Path(output_path).write_bytes(data)
+    _atomic_write(Path(output_path), bytes(data))
 
 
 def _extract_bmp(cover_path: str, password: str, stego_key: str, progress: ProgressCallback | None) -> bytes:
@@ -323,9 +400,12 @@ def _embed_wav(
 
     _write_bits(frames, 0, len(frames), container, options, progress, 25, 92)
 
-    with wave.open(output_path, "wb") as writer:
-        writer.setparams(params)
-        writer.writeframes(frames)
+    def write_output(temp_path: Path) -> None:
+        with wave.open(str(temp_path), "wb") as writer:
+            writer.setparams(params)
+            writer.writeframes(frames)
+
+    _atomic_write_with(Path(output_path), write_output)
 
 
 def _extract_wav(cover_path: str, password: str, stego_key: str, progress: ProgressCallback | None) -> bytes:
@@ -344,7 +424,7 @@ def _embed_png(
     image = read_png(cover_path)
     pixels = bytearray(image.pixels)
     _write_bits(pixels, 0, len(pixels), container, options, progress, 25, 92)
-    write_png(image.with_pixels(bytes(pixels)), output_path)
+    _atomic_write_with(Path(output_path), lambda temp_path: write_png(image.with_pixels(bytes(pixels)), temp_path))
 
 
 def _extract_png(cover_path: str, password: str, stego_key: str, progress: ProgressCallback | None) -> bytes:
@@ -363,7 +443,15 @@ def _embed_jpeg_dct(
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(container)
-        jpeg_embed_with_backend(cover_path, output_path, temp_name, _carrier_secret(options.password, options.stego_key))
+        _atomic_write_with(
+            Path(output_path),
+            lambda temp_path: jpeg_embed_with_backend(
+                cover_path,
+                temp_path,
+                temp_name,
+                _carrier_secret(options.password, options.stego_key),
+            ),
+        )
         _progress(progress, 85, "JPEG DCT backend completed coefficient-domain embedding.")
     except JpegDctError as exc:
         raise UnsupportedCoverError(str(exc)) from exc
@@ -372,6 +460,10 @@ def _embed_jpeg_dct(
             os.unlink(temp_name)
         except OSError:
             pass
+
+
+def _embed_flac(cover_path: str, output_path: str, container: bytes) -> None:
+    _atomic_write_with(Path(output_path), lambda temp_path: embed_flac_container(cover_path, temp_path, container))
 
 
 def _extract_jpeg_dct(cover_path: str, password: str, stego_key: str, progress: ProgressCallback | None) -> bytes:
@@ -575,6 +667,20 @@ def _detect_cover_type(path: str) -> str:
     return "unknown"
 
 
+def _ensure_cover_type_available(cover_type: str) -> None:
+    if cover_type == "unknown":
+        raise UnsupportedCoverError(_supported_cover_message())
+    if cover_type == "jpg" and not jpeg_backend_available():
+        raise UnsupportedCoverError(jpeg_backend_unavailable_message())
+
+
+def _supported_cover_message() -> str:
+    formats = "BMP, PNG, WAV, or FLAC"
+    if jpeg_backend_available():
+        formats = "BMP, PNG, WAV, FLAC, or JPEG"
+    return f"Unsupported cover file. Use {formats}."
+
+
 def _bmp_pixel_offset(data: bytes | bytearray) -> int:
     if len(data) < 54 or data[:2] != b"BM":
         raise StegoError("The selected BMP file is invalid.")
@@ -628,6 +734,24 @@ def _atomic_write(path: Path, data: bytes) -> None:
     except Exception:
         try:
             os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_with(path: Path, writer: Callable[[Path], None]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        writer(temp_path)
+        with temp_path.open("r+b") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            temp_path.unlink()
         except OSError:
             pass
         raise

@@ -13,6 +13,21 @@
 
 The Analysis tab never executes inspected files. It reads bytes, parses structures, extracts strings/IOCs, and writes reports only when requested.
 
+Large files are handled with streaming hash, entropy, search, and comparison paths. Deep parsers inspect a bounded prefix when a file is too large for full in-memory parsing; reports include a note when sampling was used.
+
+Third-party analyzer plugins run in a separate Python process with a timeout. A plugin crash, timeout, or invalid result is recorded as a plugin error instead of crashing the main application.
+
+## Embed Presets
+
+The Embed tab includes presets for common workflows:
+
+- **Maximum privacy** enables compression, AES-256-GCM, scrypt, adaptive mode, spread mode, stealth density, and verify-after-embed.
+- **Balanced** enables encryption, compression, adaptive/spread carrier ordering, balanced density, and verification.
+- **Maximum capacity** keeps encryption and verification enabled while using maximum density.
+- **No encryption** leaves payload encryption disabled and requires explicit confirmation before embedding.
+
+The live security summary shows the selected encryption, KDF, density, carrier-ordering behavior, and verification status before the output file is written. Weak encryption passwords are blocked.
+
 ## Cases
 
 Choose a case folder, then add selected evidence with tags and notes. ObscuraPrimus writes:
@@ -49,6 +64,8 @@ Reports can be signed with the local GPG release key. Verify with:
 ```powershell
 gpg --verify report.html.asc report.html
 ```
+
+If the local release key does not exist, ObscuraPrimus creates it in `.gnupg-release` before signing and exports the matching public key to `docs\ObscuraPrimus_Release_Signing_2026_pubkey.asc` during release builds.
 
 ## External Tools
 

@@ -20,7 +20,7 @@ from obscuraprimus.file_analysis import (
     write_analysis_report,
 )
 from obscuraprimus.health import portable_health
-from obscuraprimus.plugins import available_plugins
+from obscuraprimus.plugins import AnalyzerPlugin, available_plugins, run_plugin
 
 
 class FileAnalysisTests(unittest.TestCase):
@@ -49,6 +49,12 @@ class FileAnalysisTests(unittest.TestCase):
 
         self.assertIn("00000000", hex_preview(target))
         self.assertEqual(search_hex(target, b"cde")[:1], [2])
+
+    def test_streaming_search_finds_chunk_boundary_match(self):
+        target = self.root / "boundary.bin"
+        target.write_bytes(b"a" * (1024 * 1024 - 2) + b"needle" + b"z")
+
+        self.assertEqual(search_hex(target, b"needle"), [1024 * 1024 - 2])
 
     def test_zip_container_and_office_macro_detection(self):
         doc = self.root / "macro.docx"
@@ -138,6 +144,24 @@ class FileAnalysisTests(unittest.TestCase):
 
         self.assertIn("data_writable", portable_health())
         self.assertTrue(available_plugins())
+
+    def test_analyzer_plugin_runs_in_subprocess(self):
+        plugin_root = self.root / "plugin"
+        plugin_root.mkdir()
+        entry = plugin_root / "plugin.py"
+        entry.write_text(
+            "def analyze_file(path):\n"
+            "    print('plugin chatter')\n"
+            "    return {'findings': ['subprocess-ok'], 'risk_delta': 3}\n",
+            encoding="utf-8",
+        )
+        plugin = AnalyzerPlugin("demo", ("*",), "demo", "1", "plugin.py", str(plugin_root))
+
+        result = run_plugin(plugin, self.root / "note.txt")
+
+        self.assertEqual(result["plugin"], "demo")
+        self.assertEqual(result["findings"], ["subprocess-ok"])
+        self.assertEqual(result["risk_delta"], 3)
 
 
 if __name__ == "__main__":

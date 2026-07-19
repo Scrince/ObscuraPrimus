@@ -21,7 +21,6 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .flac_codec import FlacCodecError, inspect_flac
-from .runtime import app_base_dir
 
 
 MAGIC_SIGNATURES: tuple[tuple[bytes, str], ...] = (
@@ -56,6 +55,8 @@ EXTENSION_HINTS = {
 }
 
 SCRIPT_EXTENSIONS = {".ps1", ".bat", ".cmd", ".js", ".vbs", ".py"}
+CHUNK_SIZE = 1024 * 1024
+ANALYSIS_FULL_READ_LIMIT = 64 * CHUNK_SIZE
 CARVE_SIGNATURES: tuple[tuple[bytes, bytes, str], ...] = (
     (b"\x89PNG\r\n\x1a\n", b"IEND\xaeB`\x82", "png"),
     (b"\xff\xd8\xff", b"\xff\xd9", "jpg"),
@@ -102,12 +103,13 @@ class FileAnalysis:
 
 def analyze_file(path: str | Path, deep: bool = True, yara_rules: str = "") -> FileAnalysis:
     file_path = Path(path)
-    data = file_path.read_bytes()
     stat = file_path.stat()
+    data = _read_analysis_bytes(file_path, stat.st_size)
+    sampled = stat.st_size > len(data)
     magic_type = identify_magic(data)
     extension_type = EXTENSION_HINTS.get(file_path.suffix.lower(), "unknown")
     mismatch = bool(extension_type != "unknown" and magic_type != "unknown" and extension_type != magic_type)
-    hashes = hash_bytes(data)
+    hashes = hash_file(file_path)
     entropy_map = entropy_blocks(data) if deep else []
     strings = extract_strings(data) if deep else []
     iocs = extract_iocs(data) if deep else {}
@@ -124,6 +126,8 @@ def analyze_file(path: str | Path, deep: bool = True, yara_rules: str = "") -> F
     script = inspect_script(file_path, data) if file_path.suffix.lower() in SCRIPT_EXTENSIONS else {}
     ads = detect_ads(file_path)
     suspicious = suspicious_path_flags(file_path)
+    if sampled:
+        suspicious.append(f"Large file sampled for deep parsing; first {len(data):,} of {stat.st_size:,} bytes inspected.")
     if mismatch:
         suspicious.append(f"Extension suggests {extension_type}, but magic bytes indicate {magic_type}.")
     if yara_rules:
@@ -137,13 +141,13 @@ def analyze_file(path: str | Path, deep: bool = True, yara_rules: str = "") -> F
         metadata["clamav"] = clamav
     analysis = FileAnalysis(
         path=str(file_path),
-        size=len(data),
+        size=stat.st_size,
         extension=file_path.suffix.lower(),
         magic_type=magic_type,
         extension_type=extension_type,
         signature_mismatch=mismatch,
         hashes=hashes,
-        entropy=entropy(data),
+        entropy=entropy_file(file_path),
         entropy_map=entropy_map,
         timestamps={"created": stat.st_ctime, "modified": stat.st_mtime, "accessed": stat.st_atime},
         strings=strings[:500],
@@ -194,6 +198,11 @@ def analyze_path(
     return results
 
 
+def _read_analysis_bytes(path: Path, size: int) -> bytes:
+    with path.open("rb") as handle:
+        return handle.read(min(size, ANALYSIS_FULL_READ_LIMIT))
+
+
 def build_case_dashboard(results: list[FileAnalysis]) -> dict:
     duplicate_groups: dict[str, list[str]] = {}
     ioc_counts: dict[str, int] = {}
@@ -235,6 +244,31 @@ def hash_bytes(data: bytes) -> dict[str, str]:
     }
 
 
+def hash_file(path: str | Path) -> dict[str, str]:
+    md5 = hashlib.md5(usedforsecurity=False)
+    sha1 = hashlib.sha1(usedforsecurity=False)
+    sha256 = hashlib.sha256()
+    sha512 = hashlib.sha512()
+    blake2b = hashlib.blake2b()
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            md5.update(chunk)
+            sha1.update(chunk)
+            sha256.update(chunk)
+            sha512.update(chunk)
+            blake2b.update(chunk)
+    return {
+        "md5": md5.hexdigest(),
+        "sha1": sha1.hexdigest(),
+        "sha256": sha256.hexdigest(),
+        "sha512": sha512.hexdigest(),
+        "blake2b": blake2b.hexdigest(),
+    }
+
+
 def entropy(data: bytes) -> float:
     if not data:
         return 0.0
@@ -242,6 +276,22 @@ def entropy(data: bytes) -> float:
     for byte in data:
         counts[byte] += 1
     total = len(data)
+    return -sum((count / total) * math.log2(count / total) for count in counts if count)
+
+
+def entropy_file(path: str | Path) -> float:
+    counts = [0] * 256
+    total = 0
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            total += len(chunk)
+            for byte in chunk:
+                counts[byte] += 1
+    if not total:
+        return 0.0
     return -sum((count / total) * math.log2(count / total) for count in counts if count)
 
 
@@ -253,8 +303,7 @@ def entropy_blocks(data: bytes, block_size: int = 4096) -> list[dict]:
 
 
 def entropy_chart_data(path: str | Path, block_size: int = 4096) -> list[tuple[int, float]]:
-    data = Path(path).read_bytes()
-    return [(entry["offset"], entry["entropy"]) for entry in entropy_blocks(data, block_size)]
+    return [(entry["offset"], entry["entropy"]) for entry in entropy_blocks(_read_analysis_bytes(Path(path), Path(path).stat().st_size), block_size)]
 
 
 def hex_preview(path: str | Path, offset: int = 0, length: int = 512) -> str:
@@ -271,35 +320,57 @@ def hex_preview(path: str | Path, offset: int = 0, length: int = 512) -> str:
 
 
 def search_hex(path: str | Path, needle: bytes) -> list[int]:
-    data = Path(path).read_bytes()
+    if not needle:
+        return []
     offsets = []
-    start = 0
-    while True:
-        found = data.find(needle, start)
-        if found == -1:
-            return offsets
-        offsets.append(found)
-        start = found + 1
+    overlap = max(0, len(needle) - 1)
+    previous = b""
+    absolute = 0
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(CHUNK_SIZE)
+            if not chunk:
+                return offsets
+            haystack = previous + chunk
+            search_start = 0
+            base = absolute - len(previous)
+            while True:
+                found = haystack.find(needle, search_start)
+                if found == -1:
+                    break
+                real_offset = base + found
+                if real_offset >= 0 and (not offsets or offsets[-1] != real_offset):
+                    offsets.append(real_offset)
+                search_start = found + 1
+            previous = haystack[-overlap:] if overlap else b""
+            absolute += len(chunk)
 
 
 def compare_files(left: str | Path, right: str | Path, max_diffs: int = 1000) -> dict:
-    left_data = Path(left).read_bytes()
-    right_data = Path(right).read_bytes()
-    limit = min(len(left_data), len(right_data))
     diffs = []
-    for index in range(limit):
-        if left_data[index] != right_data[index]:
-            diffs.append({"offset": index, "left": left_data[index], "right": right_data[index]})
-            if len(diffs) >= max_diffs:
+    offset = 0
+    with Path(left).open("rb") as left_handle, Path(right).open("rb") as right_handle:
+        while len(diffs) < max_diffs:
+            left_chunk = left_handle.read(CHUNK_SIZE)
+            right_chunk = right_handle.read(CHUNK_SIZE)
+            if not left_chunk or not right_chunk:
                 break
+            for index, (left_byte, right_byte) in enumerate(zip(left_chunk, right_chunk)):
+                if left_byte != right_byte:
+                    diffs.append({"offset": offset + index, "left": left_byte, "right": right_byte})
+                    if len(diffs) >= max_diffs:
+                        break
+            offset += min(len(left_chunk), len(right_chunk))
+    left_size = Path(left).stat().st_size
+    right_size = Path(right).stat().st_size
     return {
         "left": str(left),
         "right": str(right),
-        "left_hashes": hash_bytes(left_data),
-        "right_hashes": hash_bytes(right_data),
-        "left_entropy": entropy(left_data),
-        "right_entropy": entropy(right_data),
-        "size_delta": len(left_data) - len(right_data),
+        "left_hashes": hash_file(left),
+        "right_hashes": hash_file(right),
+        "left_entropy": entropy_file(left),
+        "right_entropy": entropy_file(right),
+        "size_delta": left_size - right_size,
         "diff_count_sample": len(diffs),
         "diffs": diffs,
     }
@@ -935,37 +1006,13 @@ def write_analysis_report(results: list[FileAnalysis], output_path: str) -> None
 
 
 def sign_report(report_path: str | Path, gpg_exe: str = "", gpg_home: str = "") -> Path | None:
-    executable = gpg_exe or shutil.which("gpg") or shutil.which("gpg.exe") or r"C:\Program Files\Git\usr\bin\gpg.exe"
-    if not executable or not Path(executable).exists():
+    from .signing import ensure_release_key, make_config, sign_file
+
+    config = make_config(gpg_exe, gpg_home)
+    if not config:
         return None
-    home = Path(gpg_home) if gpg_home else app_base_dir() / ".gnupg-release"
-    if not home.exists():
-        return None
-    home_arg = str(home)
-    if "Git\\usr\\bin\\gpg.exe" in executable and re.match(r"^[A-Za-z]:\\", home_arg):
-        drive = home_arg[0].lower()
-        rest = home_arg[3:].replace("\\", "/")
-        home_arg = f"/{drive}/{rest}"
-    report = Path(report_path)
-    signature = report.with_suffix(report.suffix + ".asc")
-    subprocess.run(
-        [
-            executable,
-            "--homedir",
-            home_arg,
-            "--batch",
-            "--yes",
-            "--armor",
-            "--detach-sign",
-            "--local-user",
-            "ObscuraPrimus Release Signing (2026) <release@obscuraprimus.local>",
-            "--output",
-            str(signature),
-            str(report),
-        ],
-        check=True,
-    )
-    return signature
+    ensure_release_key(config)
+    return sign_file(report_path, config)
 
 
 def write_csv_report(results: list[FileAnalysis], output_path: str) -> None:

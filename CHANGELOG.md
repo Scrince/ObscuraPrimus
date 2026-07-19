@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Added guided embed presets and a live security summary in the GUI.
+- Blocked weak encryption passwords before embed operations.
+- Added streaming hashes, entropy, byte search, and file comparison for large evidence files.
+- Added bounded deep parsing for very large files with report notes when sampling is used.
+- Moved third-party analyzer plugin execution into subprocesses with timeout and JSON result validation.
+- Added a centralized PGP signing helper for release artifacts and signed reports.
+- Updated release signing to create/export the local release key through the shared signing helper.
+- Added regression tests for streaming search and subprocess plugin execution.
+
 ## 1.0.0 - 2026-07-04
 
 - Initial PySide6 desktop application.

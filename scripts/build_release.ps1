@@ -49,7 +49,9 @@ Windows portable release.
 - LICENSE
 - CHANGELOG.md
 - SBOM.json
+- SBOM.json.asc
 - DEPENDENCY_LICENSES.md
+- DEPENDENCY_LICENSES.md.asc
 
 ## Usage
 
@@ -64,65 +66,34 @@ $notes | Set-Content -Encoding UTF8 (Join-Path $ReleaseDir "RELEASE_NOTES.md")
 $ChecksumPath = Join-Path $ReleaseRoot "SHA256SUMS.txt"
 
 if (!$GpgExe) {
-    $candidate = "C:\Program Files\Git\usr\bin\gpg.exe"
-    if (Test-Path $candidate) {
-        $GpgExe = $candidate
+    $cmd = Get-Command gpg -ErrorAction SilentlyContinue
+    if ($cmd) {
+        $GpgExe = $cmd.Source
     } else {
-        $cmd = Get-Command gpg -ErrorAction SilentlyContinue
-        if ($cmd) { $GpgExe = $cmd.Source }
+        $candidate = "C:\Program Files\Git\usr\bin\gpg.exe"
+        if (Test-Path $candidate) {
+            $GpgExe = $candidate
+        }
     }
 }
 
-if ($GpgExe) {
-    $previousErrorActionPreference = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    if (!$GpgHome) {
-        $GpgHome = Join-Path $Root ".gnupg-release"
-    }
-    New-Item -ItemType Directory -Force $GpgHome | Out-Null
-    $resolvedGpgHome = (Resolve-Path $GpgHome).Path
-    if ($GpgExe -like "*\Git\usr\bin\gpg.exe" -and $resolvedGpgHome -match "^([A-Za-z]):\\(.*)$") {
-        $drive = $Matches[1].ToLowerInvariant()
-        $rest = $Matches[2] -replace "\\", "/"
-        $gpgHomeArg = "/$drive/$rest"
-    } else {
-        $gpgHomeArg = $resolvedGpgHome
-    }
-    $secretKeys = & $GpgExe --homedir $gpgHomeArg --list-secret-keys --with-colons $GpgKey 2>$null
-    if (!$secretKeys) {
-        $batch = Join-Path $ReleaseRoot "gpg-keygen.batch"
-        @"
-Key-Type: RSA
-Key-Length: 4096
-Key-Usage: sign
-Name-Real: ObscuraPrimus Release Signing
-Name-Comment: 2026
-Name-Email: release@obscuraprimus.local
-Expire-Date: 2y
-%no-protection
-%commit
-"@ | Set-Content -Encoding ASCII $batch
-        & $GpgExe --homedir $gpgHomeArg --batch --generate-key $batch
-        Remove-Item $batch -Force
-    }
-
-    $publicKey = Join-Path $DocsDir "ObscuraPrimus_Release_Signing_2026_pubkey.asc"
-    New-Item -ItemType Directory -Force $DocsDir | Out-Null
-    & $GpgExe --homedir $gpgHomeArg --armor --export $GpgKey | Set-Content -Encoding ASCII $publicKey
-
-    foreach ($artifact in @($ExePath, $SbomPath, $LicenseReportPath)) {
-        $sig = "$artifact.asc"
-        if (Test-Path $sig) { Remove-Item $sig -Force }
-        & $GpgExe --homedir $gpgHomeArg --batch --yes --armor --detach-sign --local-user $GpgKey --output $sig $artifact
-        if ($LASTEXITCODE -ne 0) {
-            $ErrorActionPreference = $previousErrorActionPreference
-            throw "GPG signing failed for $artifact"
-        }
+$publicKey = Join-Path $DocsDir "ObscuraPrimus_Release_Signing_2026_pubkey.asc"
+$pgpArgs = @("scripts\pgp_release.py")
+if ($GpgExe) { $pgpArgs += @("--gpg-exe", $GpgExe) }
+if ($GpgHome) { $pgpArgs += @("--gpg-home", $GpgHome) }
+if ($GpgKey) { $pgpArgs += @("--key-id", $GpgKey) }
+$pgpAvailable = $false
+$ensureOutput = & python @pgpArgs "ensure-key" "--public-key" $publicKey
+if ($LASTEXITCODE -eq 0) {
+    $pgpAvailable = $true
+    Write-Host "PGP signing key ready: $ensureOutput"
+    & python @pgpArgs "sign" $ExePath $SbomPath $LicenseReportPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "PGP signing failed for pre-zip artifacts"
     }
     Copy-Item "$ExePath.asc" (Join-Path $ReleaseDir "ObscuraPrimus.exe.asc") -Force
     Copy-Item "$SbomPath.asc" (Join-Path $ReleaseDir "SBOM.json.asc") -Force
     Copy-Item "$LicenseReportPath.asc" (Join-Path $ReleaseDir "DEPENDENCY_LICENSES.md.asc") -Force
-    $ErrorActionPreference = $previousErrorActionPreference
 } else {
     Write-Warning "GPG was not found; release artifacts were not PGP-signed."
 }
@@ -132,17 +103,11 @@ if (Test-Path $ZipPath) {
 }
 Compress-Archive -Path (Join-Path $ReleaseDir "*") -DestinationPath $ZipPath
 
-if ($GpgExe) {
-    $previousErrorActionPreference = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    $sig = "$ZipPath.asc"
-    if (Test-Path $sig) { Remove-Item $sig -Force }
-    & $GpgExe --homedir $gpgHomeArg --batch --yes --armor --detach-sign --local-user $GpgKey --output $sig $ZipPath
+if ($pgpAvailable) {
+    & python @pgpArgs "sign" $ZipPath
     if ($LASTEXITCODE -ne 0) {
-        $ErrorActionPreference = $previousErrorActionPreference
-        throw "GPG signing failed for $ZipPath"
+        throw "PGP signing failed for $ZipPath"
     }
-    $ErrorActionPreference = $previousErrorActionPreference
 }
 
 $checksumTargets = @($ExePath, $ZipPath, $SbomPath, $LicenseReportPath)
@@ -154,17 +119,11 @@ Get-FileHash -Algorithm SHA256 $checksumTargets |
     ForEach-Object { "$($_.Hash.ToLower())  $([IO.Path]::GetFileName($_.Path))" } |
     Set-Content -Encoding ASCII $ChecksumPath
 
-if ($GpgExe) {
-    $previousErrorActionPreference = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    $sig = "$ChecksumPath.asc"
-    if (Test-Path $sig) { Remove-Item $sig -Force }
-    & $GpgExe --homedir $gpgHomeArg --batch --yes --armor --detach-sign --local-user $GpgKey --output $sig $ChecksumPath
+if ($pgpAvailable) {
+    & python @pgpArgs "sign" $ChecksumPath
     if ($LASTEXITCODE -ne 0) {
-        $ErrorActionPreference = $previousErrorActionPreference
-        throw "GPG signing failed for $ChecksumPath"
+        throw "PGP signing failed for $ChecksumPath"
     }
-    $ErrorActionPreference = $previousErrorActionPreference
 }
 
 Write-Host "Release created:"

@@ -56,6 +56,7 @@ from . import __version__
 from .file_analysis import add_evidence, analyze_path, carve_embedded_files, compare_files, create_case, hex_preview, search_hex, sign_report, write_analysis_report
 from .forensics import scan_path, write_report
 from .health import check_github_update, portable_health
+from .jpeg_dct import backend_available as jpeg_backend_available
 from .plugins import available_plugins
 from .runtime import configure_logging, load_config, log_path, portable_data_dir, save_config
 from .stego_engine import EmbedOptions, StegoError, embed_file, estimate_capacity, estimate_distortion, extract_file
@@ -64,7 +65,9 @@ from .stego_engine import EmbedOptions, StegoError, embed_file, estimate_capacit
 STYLE = """
 QWidget {
     background: #15161a;
+        pass
     color: #e8e9ee;
+        pass
     font-family: "Segoe UI", "Inter", sans-serif;
     font-size: 10.5pt;
 }
@@ -79,19 +82,24 @@ QGroupBox::title {
     left: 12px;
     padding: 0 6px;
     color: #aeb6c8;
+        pass
 }
 QLineEdit, QComboBox, QPlainTextEdit {
     background: #202229;
+        pass
     border: 1px solid #353844;
     border-radius: 6px;
     padding: 8px;
     selection-background-color: #3b82f6;
+        pass
 }
 QLineEdit[dropActive="true"] {
     border-color: #69d2a0;
+        pass
 }
 QPushButton {
     background: #2f6fed;
+        pass
     border: 0;
     border-radius: 6px;
     color: white;
@@ -100,16 +108,20 @@ QPushButton {
 }
 QPushButton:hover {
     background: #3f7df5;
+        pass
 }
 QPushButton:disabled {
     background: #3a3d47;
+        pass
     color: #8e94a3;
+        pass
 }
 QCheckBox {
     spacing: 8px;
 }
 QProgressBar {
     background: #202229;
+        pass
     border: 1px solid #353844;
     border-radius: 6px;
     height: 18px;
@@ -117,6 +129,7 @@ QProgressBar {
 }
 QProgressBar::chunk {
     background: #69d2a0;
+        pass
     border-radius: 5px;
 }
 QTabWidget::pane {
@@ -126,21 +139,68 @@ QTabWidget::pane {
 }
 QTabBar::tab {
     background: #202229;
+        pass
     border: 1px solid #30323a;
     padding: 10px 18px;
 }
 QTabBar::tab:selected {
     background: #2b2e38;
+        pass
     color: #ffffff;
+        pass
 }
 """
 
 HIGH_CONTRAST_STYLE = STYLE + """
 QWidget { background: #000000; color: #ffffff; }
+    pass
 QLineEdit, QComboBox, QPlainTextEdit { background: #050505; border-color: #ffffff; }
+    pass
 QPushButton { background: #ffffff; color: #000000; }
+    pass
 QProgressBar::chunk { background: #ffffff; }
+    pass
 """
+
+EMBED_PRESETS = {
+    "Custom": {},
+    "Maximum privacy": {
+        "compress": True,
+        "adaptive": True,
+        "spread": True,
+        "density": "stealth",
+        "encryption": "AES-256-GCM",
+        "kdf": "scrypt",
+        "verify": True,
+    },
+    "Balanced": {
+        "compress": True,
+        "adaptive": True,
+        "spread": True,
+        "density": "balanced",
+        "encryption": "AES-256-GCM",
+        "kdf": "PBKDF2-HMAC-SHA256",
+        "verify": True,
+    },
+    "Maximum capacity": {
+        "compress": True,
+        "adaptive": False,
+        "spread": False,
+        "density": "maximum",
+        "encryption": "AES-256-GCM",
+        "kdf": "PBKDF2-HMAC-SHA256",
+        "verify": True,
+    },
+    "No encryption": {
+        "compress": True,
+        "adaptive": False,
+        "spread": False,
+        "density": "maximum",
+        "encryption": "None",
+        "kdf": "PBKDF2-HMAC-SHA256",
+        "verify": True,
+    },
+}
 
 
 class DropLineEdit(QLineEdit):
@@ -280,7 +340,7 @@ class Worker(QObject):
             else:
                 result = extract_file(progress=self._progress, **self.kwargs)
                 self.finished.emit(f"Extracted {result.filename}.")
-        except Exception as exc:  # GUI boundary: show concise error, log traceback.
+        except Exception as exc:  
             logging.exception("Worker failed")
             detail = "".join(traceback.format_exception_only(type(exc), exc)).strip()
             self.failed.emit(detail)
@@ -406,7 +466,7 @@ class MainWindow(QMainWindow):
         self.output_input = DropLineEdit("Output stego file path")
         form.addWidget(QLabel("Cover File"), 0, 0)
         form.addWidget(self.cover_input, 0, 1)
-        form.addWidget(self._browse_button(self.cover_input, "Cover File", "Supported covers (*.bmp *.png *.wav *.flac);;JPEG backend (*.jpg *.jpeg);;All files (*.*)"), 0, 2)
+        form.addWidget(self._browse_button(self.cover_input, "Cover File", self._cover_file_filter()), 0, 2)
         form.addWidget(QLabel("Secret File"), 1, 0)
         form.addWidget(self.secret_input, 1, 1)
         form.addWidget(self._browse_button(self.secret_input, "Secret File", "All files (*.*)"), 1, 2)
@@ -416,6 +476,8 @@ class MainWindow(QMainWindow):
 
         options_box = QGroupBox("Options")
         options = QFormLayout(options_box)
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(list(EMBED_PRESETS))
         self.compress_check = QCheckBox("Compress with zlib")
         self.compress_check.setChecked(bool(self.config.get("default_compress", True)))
         self.adaptive_check = QCheckBox("Adaptive embedding")
@@ -441,6 +503,9 @@ class MainWindow(QMainWindow):
         self.stego_key_input.setEchoMode(QLineEdit.Password)
         self.stego_key_input.setPlaceholderText("Optional separate key for adaptive/spread carrier ordering")
         self.verify_check = QCheckBox("Verify after embed")
+        self.security_summary_label = QLabel("")
+        self.security_summary_label.setWordWrap(True)
+        options.addRow("Preset", self.preset_combo)
         options.addRow(self.compress_check)
         options.addRow(self.adaptive_check)
         options.addRow(self.spread_check)
@@ -454,6 +519,7 @@ class MainWindow(QMainWindow):
         self.password_strength_label = QLabel("Password strength: not evaluated")
         self.distortion_label = QLabel("Distortion estimate: choose cover and secret files.")
         options.addRow(self.password_strength_label)
+        options.addRow("Security", self.security_summary_label)
 
         self.capacity_label = QLabel("Capacity: choose a cover file to estimate usable payload.")
         self.cover_input.textChanged.connect(self._update_capacity)
@@ -462,6 +528,19 @@ class MainWindow(QMainWindow):
         self.spread_check.stateChanged.connect(self._update_capacity)
         self.density_combo.currentTextChanged.connect(self._update_capacity)
         self.password_input.textChanged.connect(self._update_password_strength)
+        self.preset_combo.currentTextChanged.connect(self._apply_embed_preset)
+        for widget in (
+            self.compress_check,
+            self.adaptive_check,
+            self.spread_check,
+            self.verify_check,
+        ):
+            widget.stateChanged.connect(self._update_security_summary)
+        self.density_combo.currentTextChanged.connect(self._update_security_summary)
+        self.encryption_combo.currentTextChanged.connect(self._update_security_summary)
+        self.kdf_combo.currentTextChanged.connect(self._update_security_summary)
+        self.stego_key_input.textChanged.connect(self._update_security_summary)
+        self._update_security_summary()
 
         self.embed_progress = QProgressBar()
         self.embed_log = self._log_widget()
@@ -496,7 +575,7 @@ class MainWindow(QMainWindow):
         self.extract_output_input = DropLineEdit("Output file path")
         form.addWidget(QLabel("Stego File"), 0, 0)
         form.addWidget(self.extract_cover_input, 0, 1)
-        form.addWidget(self._browse_button(self.extract_cover_input, "Stego File", "Supported covers (*.bmp *.png *.wav *.flac);;JPEG backend (*.jpg *.jpeg);;All files (*.*)"), 0, 2)
+        form.addWidget(self._browse_button(self.extract_cover_input, "Stego File", self._cover_file_filter()), 0, 2)
         form.addWidget(QLabel("Output File"), 1, 0)
         form.addWidget(self.extract_output_input, 1, 1)
         form.addWidget(self._save_button(self.extract_output_input, "Save Extracted File", "All files (*.*)"), 1, 2)
@@ -968,6 +1047,13 @@ class MainWindow(QMainWindow):
         button.clicked.connect(lambda: self._choose_open_file(target, title, file_filter))
         return button
 
+    def _cover_file_filter(self) -> str:
+        filters = ["Supported covers (*.bmp *.png *.wav *.flac)"]
+        if jpeg_backend_available():
+            filters.append("JPEG-DCT backend (*.jpg *.jpeg)")
+        filters.append("All files (*.*)")
+        return ";;".join(filters)
+
     def _save_button(self, target: QLineEdit, title: str, file_filter: str) -> QPushButton:
         button = QPushButton("Save As")
         button.clicked.connect(lambda: self._choose_save_file(target, title, file_filter))
@@ -1008,6 +1094,9 @@ class MainWindow(QMainWindow):
             return
         if algorithm != "None" and not password:
             self._warn("Enter a password when encryption is enabled.")
+            return
+        if algorithm != "None" and self._password_strength_score(password) <= 2:
+            self._warn("Use a stronger encryption password before embedding.")
             return
         if algorithm != "None" and password != self.password_confirm_input.text():
             self._warn("Password confirmation does not match.")
@@ -1405,13 +1494,7 @@ class MainWindow(QMainWindow):
 
     def _update_password_strength(self) -> None:
         password = self.password_input.text()
-        score = 0
-        score += len(password) >= 12
-        score += len(password) >= 18
-        score += any(ch.islower() for ch in password)
-        score += any(ch.isupper() for ch in password)
-        score += any(ch.isdigit() for ch in password)
-        score += any(not ch.isalnum() for ch in password)
+        score = self._password_strength_score(password)
         if not password:
             label = "not evaluated"
         elif score <= 2:
@@ -1421,6 +1504,58 @@ class MainWindow(QMainWindow):
         else:
             label = "strong"
         self.password_strength_label.setText(f"Password strength: {label}")
+        self._update_security_summary()
+
+    def _password_strength_score(self, password: str) -> int:
+        score = 0
+        score += len(password) >= 12
+        score += len(password) >= 18
+        score += any(ch.islower() for ch in password)
+        score += any(ch.isupper() for ch in password)
+        score += any(ch.isdigit() for ch in password)
+        score += any(not ch.isalnum() for ch in password)
+        return int(score)
+
+    def _apply_embed_preset(self, name: str) -> None:
+        preset = EMBED_PRESETS.get(name, {})
+        if not preset:
+            self._update_security_summary()
+            return
+        self.compress_check.setChecked(bool(preset["compress"]))
+        self.adaptive_check.setChecked(bool(preset["adaptive"]))
+        self.spread_check.setChecked(bool(preset["spread"]))
+        self.verify_check.setChecked(bool(preset["verify"]))
+        self.density_combo.setCurrentText(str(preset["density"]))
+        encryption = str(preset["encryption"])
+        if self.encryption_combo.findText(encryption) >= 0:
+            self.encryption_combo.setCurrentText(encryption)
+        self.kdf_combo.setCurrentText(str(preset["kdf"]))
+        self._update_capacity()
+        self._update_security_summary()
+
+    def _update_security_summary(self, *_args) -> None:
+        if not hasattr(self, "security_summary_label"):
+            return
+        algorithm = self.encryption_combo.currentText()
+        parts = []
+        if algorithm == "None":
+            parts.append("No encryption; hidden bytes can be recovered if the carrier is decoded.")
+        else:
+            parts.append(f"{algorithm} with {self.kdf_combo.currentText()}.")
+            score = self._password_strength_score(self.password_input.text())
+            if score <= 2:
+                parts.append("Password must be stronger before embedding.")
+        if self.compress_check.isChecked():
+            parts.append("Compression reduces payload size before embedding.")
+        if self.spread_check.isChecked():
+            carrier_key = "separate stego key" if self.stego_key_input.text() else "encryption password"
+            parts.append(f"Spread mode uses a {carrier_key} for carrier ordering.")
+        if self.adaptive_check.isChecked():
+            parts.append("Adaptive mode avoids carrier extremes.")
+        parts.append(f"Density is {self.density_combo.currentText()}.")
+        if self.verify_check.isChecked():
+            parts.append("Verify-after-embed will read the payload back before success.")
+        self.security_summary_label.setText(" ".join(parts))
 
 
 def main() -> int:

@@ -45,8 +45,14 @@ class AdvancedAnalysisTests(unittest.TestCase):
         secret.write_text("hidden in a valid FLAC metadata block", encoding="utf-8")
 
         self.assertGreater(estimate_capacity(str(cover)), 1000)
-        embed_file(str(cover), str(secret), str(stego), EmbedOptions(compress=False))
-        result = extract_file(str(stego), str(out))
+        # FLAC APPLICATION-block stego requires encryption (payload is discoverable otherwise).
+        options = EmbedOptions(
+            compress=False,
+            encryption="AES-256-GCM",
+            password="flac-test-password",
+        )
+        embed_file(str(cover), str(secret), str(stego), options)
+        result = extract_file(str(stego), str(out), password="flac-test-password")
 
         self.assertEqual((out / result.filename).read_text(encoding="utf-8"), "hidden in a valid FLAC metadata block")
         self.assertTrue(inspect_flac(stego)["obscuraprimus_payload"])

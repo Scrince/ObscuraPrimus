@@ -25,6 +25,11 @@ ObscuraPrimus is a USB-portable steganography desktop app written in Python and 
 - GUI and CLI workflows.
 - Portable settings page with default options and high-contrast mode.
 - Drag-and-drop file fields, progress bars, and status logs.
+- Guided embed presets for maximum privacy, balanced use, maximum capacity, and explicit no-encryption workflows.
+- Live embed security summaries that show encryption, KDF, carrier-ordering, density, and verification choices before writing output.
+- Streaming hashes, entropy, search, and file comparison for large evidence files, with sampled deep parsing noted in reports.
+- Analyzer plugins run in a separate Python process with timeout handling so plugin failures do not poison the main process.
+- Centralized PGP release/report signing helpers that create or reuse the portable release key, export the public key, and write detached signatures.
 
 ## Project Layout
 
@@ -59,11 +64,12 @@ python app.py
 3. Choose the secret file to hide.
 4. Pick an output path such as `cover_obscura.bmp`.
 5. Enable compression, encryption, and adaptive embedding as desired.
-6. If encryption is enabled, enter a password.
-7. Click **Embed File**.
-8. In the Extract tab, choose the generated stego file.
-9. Enter the same password if encryption was used.
-10. Choose an output filename and click **Extract File**.
+6. Choose a preset or adjust the advanced options manually.
+7. If encryption is enabled, enter a strong password.
+8. Click **Embed File**.
+9. In the Extract tab, choose the generated stego file.
+10. Enter the same password if encryption was used.
+11. Choose an output filename and click **Extract File**.
 
 ## CLI Workflow
 
@@ -94,6 +100,10 @@ Supported built-in inspection includes PNG/BMP/WAV/JPEG/PDF/ZIP/Office/tar/gzip/
 Case workspaces include a manifest, SQLite `case.db`, and append-only audit log for evidence intake. Reports can be signed with the same local GPG release-signing pattern.
 
 The case database stores files, findings, IOCs, tags, notes, timeline events, reports, chain-of-custody entries, and full-text search indexes. Findings support status, severity, owner, false-positive state, and report inclusion state.
+
+Large evidence files are handled with streaming hash, entropy, search, and comparison paths. Deep parsers inspect a bounded prefix for very large files and add a report note when sampling is used.
+
+Third-party analyzer plugins are launched in a subprocess with a timeout. Built-in analyzers remain in-process.
 
 Additional CLI utilities:
 
@@ -142,7 +152,7 @@ Or use the release script, which also creates a zip and checksums:
 powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1 -Version 1.0.0
 ```
 
-The release script also creates detached ASCII-armored PGP signatures when GPG is available. By default it uses a local `.gnupg-release` keyring and exports the public key to:
+The release script also creates detached ASCII-armored PGP signatures when GPG is available. By default it uses the centralized ObscuraPrimus PGP helper, creates or reuses a local `.gnupg-release` keyring, and exports the public key to:
 
 ```text
 docs\ObscuraPrimus_Release_Signing_2026_pubkey.asc
