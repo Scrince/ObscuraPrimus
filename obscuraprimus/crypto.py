@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import os
 import hashlib
+import os
+import unicodedata
 from dataclasses import dataclass
 
 from cryptography.exceptions import InvalidTag
@@ -11,12 +12,11 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import XChaCha20Poly1305
-except ImportError:  
+except ImportError:
     XChaCha20Poly1305 = None
 
 
 PBKDF2_ITERATIONS = 390_000
-
 PBKDF2_MIN_ITERATIONS = 100_000
 PBKDF2_MAX_ITERATIONS = 1_000_000
 SCRYPT_N = 2**14
@@ -32,8 +32,13 @@ class CryptoError(ValueError):
     pass
 
 
+def _normalize_password(password: str) -> str:
+    if not isinstance(password, str):
+        raise CryptoError("A password is required for encryption.")
+    return unicodedata.normalize("NFKC", password)
+
+
 def _require_pbkdf2_iterations(iterations: int) -> int:
-    """Reject out-of-range iteration counts (no silent re-derivation with different N)."""
     try:
         value = int(iterations)
     except (TypeError, ValueError) as exc:
@@ -60,11 +65,12 @@ def is_xchacha_available() -> bool:
 
 
 def derive_key(password: str, salt: bytes, iterations: int = PBKDF2_ITERATIONS, kdf: str = "PBKDF2-HMAC-SHA256") -> bytes:
-    if not password:
+    normalized = _normalize_password(password)
+    if not normalized:
         raise CryptoError("A password is required for encryption.")
     if kdf == "scrypt":
         return hashlib.scrypt(
-            password.encode("utf-8"),
+            normalized.encode("utf-8"),
             salt=salt,
             n=SCRYPT_N,
             r=SCRYPT_R,
@@ -80,7 +86,7 @@ def derive_key(password: str, salt: bytes, iterations: int = PBKDF2_ITERATIONS, 
         salt=salt,
         iterations=safe_iterations,
     )
-    return pbkdf.derive(password.encode("utf-8"))
+    return pbkdf.derive(normalized.encode("utf-8"))
 
 
 def encrypt(
@@ -119,7 +125,6 @@ def decrypt(
     associated_data: bytes | None = None,
 ) -> bytes:
     try:
-        # Validate iterations before deriving so out-of-range files fail explicitly.
         if kdf == "PBKDF2-HMAC-SHA256":
             iterations = _require_pbkdf2_iterations(iterations)
         key = derive_key(password, salt, iterations, kdf)

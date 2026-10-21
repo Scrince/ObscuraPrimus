@@ -9,9 +9,9 @@ from obscuraprimus.advanced_analysis import (
     anomaly_score,
     byte_histogram,
     carving_preview,
-    import_immutable_evidence,
     export_case_bundle,
     import_case_bundle,
+    import_immutable_evidence,
     inspect_browser_artifact,
     inspect_raw_image,
     inspect_windows_artifact,
@@ -45,7 +45,6 @@ class AdvancedAnalysisTests(unittest.TestCase):
         secret.write_text("hidden in a valid FLAC metadata block", encoding="utf-8")
 
         self.assertGreater(estimate_capacity(str(cover)), 1000)
-        # FLAC APPLICATION-block stego requires encryption (payload is discoverable otherwise).
         options = EmbedOptions(
             compress=False,
             encryption="AES-256-GCM",
@@ -87,6 +86,33 @@ class AdvancedAnalysisTests(unittest.TestCase):
         self.assertTrue(Path(exported["bundle"]).exists())
         self.assertTrue(Path(imported["output_dir"]).exists())
         self.assertTrue(carving_preview(evidence))
+
+    def test_bundle_import_rejects_traversal_member(self):
+        import io
+        import tarfile
+
+        bundle = self.root / "unsafe.tar.gz"
+        with tarfile.open(bundle, "w:gz") as archive:
+            member = tarfile.TarInfo("../escaped.txt")
+            payload = b"outside"
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+        destination = self.root / "imported"
+
+        with self.assertRaisesRegex(ValueError, "Unsafe path"):
+            import_case_bundle(bundle, destination)
+        self.assertFalse((self.root / "escaped.txt").exists())
+
+    def test_case_bundle_export_rejects_tampered_immutable_evidence(self):
+        case_dir = self.root / "case"
+        evidence = self.root / "evidence.txt"
+        evidence.write_text("original", encoding="utf-8")
+        imported = import_immutable_evidence(case_dir, evidence)
+        Path(imported["copy"]).chmod(0o600)
+        Path(imported["copy"]).write_text("changed", encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "verification failed"):
+            export_case_bundle(case_dir, self.root / "case.tar.gz")
 
     def test_rules_artifacts_detection_and_plugin_sdk(self):
         yara = self.root / "rule.yar"

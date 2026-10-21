@@ -8,10 +8,18 @@ import wave
 from pathlib import Path
 from unittest import mock
 
-from obscuraprimus.png_codec import PngImage, write_png
 from obscuraprimus.forensics import scan_path
-from obscuraprimus.stego_engine import PREFIX_SIZE, CapacityError, EmbedOptions, StegoError, UnsupportedCoverError, embed_file, estimate_capacity, extract_file
-
+from obscuraprimus.png_codec import PngImage, write_png
+from obscuraprimus.stego_engine import (
+    PREFIX_SIZE,
+    CapacityError,
+    EmbedOptions,
+    StegoError,
+    UnsupportedCoverError,
+    embed_file,
+    estimate_capacity,
+    extract_file,
+)
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 
@@ -177,6 +185,28 @@ class StegoRoundTripTests(unittest.TestCase):
         extract_file(str(stego), str(self.root), output_name="density.txt")
         self.assertEqual((self.root / "density.txt").read_text(encoding="utf-8"), "density preset")
 
+    def test_capacity_estimate_accounts_for_prefix_and_spread(self):
+        from obscuraprimus.stego_engine import _CONTAINER_FORMAT_OVERHEAD, _bmp_carrier_count
+
+        cover = FIXTURE_DIR / "sample.bmp"
+        estimate = estimate_capacity(str(cover), spread=True)
+        raw_payload_bytes = _bmp_carrier_count(str(cover), False, "maximum", True) // 8
+        self.assertEqual(estimate, max(0, raw_payload_bytes - PREFIX_SIZE - _CONTAINER_FORMAT_OVERHEAD))
+
+    def test_flac_failed_atomic_replace_preserves_existing_output(self):
+        from obscuraprimus import flac_codec
+
+        cover = self.root / "cover.flac"
+        output = self.root / "output.flac"
+        cover.write_bytes(b"fLaC" + bytes([0x80]) + (34).to_bytes(3, "big") + b"\x00" * 34 + b"\xff\xf8audioframes")
+        output.write_bytes(b"existing")
+        original = output.read_bytes()
+
+        with mock.patch("obscuraprimus.flac_codec.os.replace", side_effect=OSError("replace failed")):
+            with self.assertRaises(OSError):
+                flac_codec.embed_container(cover, output, b"payload")
+        self.assertEqual(output.read_bytes(), original)
+
     def test_embed_in_place_roundtrip(self):
         cover = self.root / "cover.bmp"
         secret = self.root / "secret.txt"
@@ -335,9 +365,9 @@ class StegoRoundTripTests(unittest.TestCase):
         bad_png.write_bytes(b"not a png")
         secret.write_text("payload", encoding="utf-8")
 
-        with self.assertRaises(Exception):
+        with self.assertRaises(StegoError):
             embed_file(str(bad_bmp), str(secret), str(self.root / "out.bmp"), EmbedOptions())
-        with self.assertRaises(Exception):
+        with self.assertRaises(StegoError):
             embed_file(str(bad_png), str(secret), str(self.root / "out.png"), EmbedOptions())
 
     def test_jpeg_without_backend_fails_with_specific_guidance(self):
@@ -347,11 +377,11 @@ class StegoRoundTripTests(unittest.TestCase):
         secret.write_text("jpeg payload", encoding="utf-8")
 
         with mock.patch.dict("os.environ", {"OBSCURAPRIMUS_JPEG_DCT_BACKEND": ""}, clear=False):
-            with self.assertRaisesRegex(UnsupportedCoverError, "JPEG-DCT carrier support is unavailable"):
+            with self.assertRaisesRegex(UnsupportedCoverError, "JPEG-DCT is an experimental optional backend"):
                 estimate_capacity(str(cover))
             with self.assertRaisesRegex(UnsupportedCoverError, "Use BMP, PNG, WAV, or FLAC"):
                 embed_file(str(cover), str(secret), str(self.root / "out.jpg"), EmbedOptions(compress=False))
-            with self.assertRaisesRegex(UnsupportedCoverError, "configure the JPEG backend"):
+            with self.assertRaisesRegex(UnsupportedCoverError, "OBSCURAPRIMUS_JPEG_DCT_BACKEND"):
                 extract_file(str(cover), str(self.root), output_name="out.txt")
 
 

@@ -1,30 +1,50 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import math
 import os
 import random
-import tempfile
 import struct
+import tempfile
 import wave
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from .compression import compress_data, decompress_data
 from .crypto import CryptoError, decrypt, encrypt
-from .flac_codec import embed_container as embed_flac_container, extract_container as extract_flac_container, metadata_capacity as flac_metadata_capacity
+from .flac_codec import (
+    FlacCodecError,
+)
+from .flac_codec import (
+    embed_container as embed_flac_container,
+)
+from .flac_codec import (
+    extract_container as extract_flac_container,
+)
+from .flac_codec import (
+    metadata_capacity as flac_metadata_capacity,
+)
 from .jpeg_dct import (
     JpegDctError,
+)
+from .jpeg_dct import (
     backend_available as jpeg_backend_available,
+)
+from .jpeg_dct import (
     backend_unavailable_message as jpeg_backend_unavailable_message,
+)
+from .jpeg_dct import (
     capacity_with_backend as jpeg_capacity_with_backend,
+)
+from .jpeg_dct import (
     embed_with_backend as jpeg_embed_with_backend,
+)
+from .jpeg_dct import (
     extract_with_backend as jpeg_extract_with_backend,
 )
-from .png_codec import PngImage, read_png, write_png
-
+from .png_codec import PngError, read_png, write_png
 
 MAGIC = b"OBP1"
 HEADER_LEN_SIZE = 4
@@ -36,6 +56,8 @@ METADATA_AAD = b"ObscuraPrimus:v2:metadata"
 DENSITY_CODES = {"maximum": 0, "balanced": 1, "stealth": 2}
 DENSITY_NAMES = {value: key for key, value in DENSITY_CODES.items()}
 DENSITY_STRIDES = {"maximum": 1, "balanced": 2, "stealth": 4}
+MAX_COVER_BYTES = 256 * 1024 * 1024
+MAX_CARRIER_INDEXES = 64 * 1024 * 1024
 ProgressCallback = Callable[[int, str], None]
 
 
@@ -153,8 +175,6 @@ def embed_file(
     elif cover_type == "jpg":
         _embed_jpeg_dct(cover_path, output_path, container, options, progress)
     elif cover_type == "flac":
-        # FLAC stores the container in a discoverable APPLICATION metadata block
-        # (not LSB stego). Require AEAD encryption so the payload is not plaintext.
         if options.encryption == "None" or not options.password:
             raise StegoError(
                 "FLAC embedding requires encryption with a password. "
@@ -162,7 +182,7 @@ def embed_file(
             )
         _embed_flac(cover_path, output_path, container)
     else:
-        raise UnsupportedCoverError("Unsupported cover file. Use BMP, PNG, or WAV.")
+        raise UnsupportedCoverError(_supported_cover_message())
 
     if options.verify_after_embed:
         _progress(progress, 95, "Verifying embedded payload...")
@@ -200,18 +220,21 @@ def extract_bytes(
     _ensure_cover_type_available(cover_type)
     _progress(progress, 5, f"Scanning {cover_type.upper()} cover...")
 
-    if cover_type == "bmp":
-        container = _extract_bmp(cover_path, password, stego_key, progress)
-    elif cover_type == "wav":
-        container = _extract_wav(cover_path, password, stego_key, progress)
-    elif cover_type == "png":
-        container = _extract_png(cover_path, password, stego_key, progress)
-    elif cover_type == "jpg":
-        container = _extract_jpeg_dct(cover_path, password, stego_key, progress)
-    elif cover_type == "flac":
-        container = extract_flac_container(cover_path)
-    else:
-        raise UnsupportedCoverError("Unsupported cover file. Use BMP, PNG, or WAV.")
+    try:
+        if cover_type == "bmp":
+            container = _extract_bmp(cover_path, password, stego_key, progress)
+        elif cover_type == "wav":
+            container = _extract_wav(cover_path, password, stego_key, progress)
+        elif cover_type == "png":
+            container = _extract_png(cover_path, password, stego_key, progress)
+        elif cover_type == "jpg":
+            container = _extract_jpeg_dct(cover_path, password, stego_key, progress)
+        elif cover_type == "flac":
+            container = extract_flac_container(cover_path)
+        else:
+            raise UnsupportedCoverError(_supported_cover_message())
+    except (PngError, FlacCodecError, JpegDctError, wave.Error, struct.error, OSError) as exc:
+        raise StegoError(str(exc)) from exc
 
     _progress(progress, 65, "Parsing hidden payload...")
     metadata, payload = _unpack_container(container)
@@ -228,7 +251,6 @@ def extract_bytes(
                 int(metadata["iterations"]),
                 metadata.get("kdf", "PBKDF2-HMAC-SHA256"),
                 primary_aad=PAYLOAD_AAD,
-                # Legacy containers may lack the kdf field and used aad=None.
                 allow_legacy_null_aad="kdf" not in metadata,
             )
         except CryptoError as exc:
@@ -271,41 +293,52 @@ def extract_bytes(
     return ExtractionResult(filename=filename, data=payload, metadata=metadata)
 
 
-# Container format overhead: magic + u32 header length + typical min metadata JSON.
-# Reserved so capacity estimates match what embed can actually pack.
 _CONTAINER_FORMAT_OVERHEAD = len(MAGIC) + HEADER_LEN_SIZE + 256
 
 
 def estimate_capacity(cover_path: str, adaptive: bool = False, spread: bool = False, density: str = "maximum") -> int:
     cover_type = _detect_cover_type(cover_path)
     _ensure_cover_type_available(cover_type)
-    if cover_type == "bmp":
-        carriers = _bmp_carrier_count(cover_path, adaptive, density)
-        raw_bytes = carriers // 8
-    elif cover_type == "wav":
-        carriers = _wav_carrier_count(cover_path, adaptive, density)
-        raw_bytes = carriers // 8
-    elif cover_type == "png":
-        carriers = _png_carrier_count(cover_path, adaptive, density)
-        raw_bytes = carriers // 8
-    elif cover_type == "jpg":
-        raw_bytes = max(0, jpeg_capacity_with_backend(cover_path))
-    elif cover_type == "flac":
-        raw_bytes = max(0, flac_metadata_capacity(cover_path))
-    else:
-        raise UnsupportedCoverError(_supported_cover_message())
-    # Subtract container framing so near-limit embeds do not over-promise.
+    try:
+        if cover_type == "bmp":
+            carriers = _bmp_carrier_count(cover_path, adaptive, density, spread)
+            raw_bytes = carriers // 8
+        elif cover_type == "wav":
+            carriers = _wav_carrier_count(cover_path, adaptive, density, spread)
+            raw_bytes = carriers // 8
+        elif cover_type == "png":
+            carriers = _png_carrier_count(cover_path, adaptive, density, spread)
+            raw_bytes = carriers // 8
+        elif cover_type == "jpg":
+            raw_bytes = max(0, jpeg_capacity_with_backend(cover_path))
+        elif cover_type == "flac":
+            raw_bytes = max(0, flac_metadata_capacity(cover_path))
+        else:
+            raise UnsupportedCoverError(_supported_cover_message())
+    except (PngError, FlacCodecError, JpegDctError, wave.Error, StegoError) as exc:
+        if isinstance(exc, StegoError):
+            raise
+        raise StegoError(str(exc)) from exc
+    if cover_type in {"bmp", "wav", "png"}:
+        raw_bytes = max(0, raw_bytes - PREFIX_SIZE)
     return max(0, raw_bytes - _CONTAINER_FORMAT_OVERHEAD)
 
 
-def estimate_distortion(cover_path: str, payload_bytes: int, adaptive: bool = False, density: str = "maximum") -> dict:
-    carriers = estimate_capacity(cover_path, adaptive, density=density)
-    changed = min(payload_bytes, carriers) * 4
+def estimate_distortion(
+    cover_path: str,
+    payload_bytes: int,
+    adaptive: bool = False,
+    density: str = "maximum",
+    spread: bool = False,
+) -> dict:
+    carriers = estimate_capacity(cover_path, adaptive, spread, density)
+    changed = min(max(0, payload_bytes), carriers) * 4
     return {
         "capacity_bytes": carriers,
         "payload_bytes": payload_bytes,
         "estimated_lsb_changes": changed,
         "estimated_change_ratio": 0.0 if carriers == 0 else changed / max(1, carriers * 8),
+        "is_heuristic": True,
     }
 
 
@@ -321,10 +354,6 @@ def _decrypt_with_aad_fallback(
     primary_aad: bytes,
     allow_legacy_null_aad: bool,
 ) -> bytes:
-    """
-    Decrypt with versioned AAD. Current format always uses primary_aad.
-    Only when the container looks legacy (missing kdf fields) do we also try aad=None.
-    """
     candidates: list[bytes | None] = [primary_aad]
     if allow_legacy_null_aad:
         candidates.append(None)
@@ -375,6 +404,7 @@ def _embed_bmp(
     options: EmbedOptions,
     progress: ProgressCallback | None,
 ) -> None:
+    _require_cover_size(cover_path)
     data = bytearray(Path(cover_path).read_bytes())
     pixel_offset = _bmp_pixel_offset(data)
     _write_bits(data, pixel_offset, len(data), container, options, progress, 25, 92)
@@ -382,6 +412,7 @@ def _embed_bmp(
 
 
 def _extract_bmp(cover_path: str, password: str, stego_key: str, progress: ProgressCallback | None) -> bytes:
+    _require_cover_size(cover_path)
     data = Path(cover_path).read_bytes()
     pixel_offset = _bmp_pixel_offset(data)
     return _read_container_from_region(data, pixel_offset, len(data), _carrier_secret(password, stego_key), progress)
@@ -394,7 +425,9 @@ def _embed_wav(
     options: EmbedOptions,
     progress: ProgressCallback | None,
 ) -> None:
+    _require_cover_size(cover_path)
     with wave.open(cover_path, "rb") as reader:
+        _validate_wav_reader(reader)
         params = reader.getparams()
         frames = bytearray(reader.readframes(reader.getnframes()))
 
@@ -409,7 +442,9 @@ def _embed_wav(
 
 
 def _extract_wav(cover_path: str, password: str, stego_key: str, progress: ProgressCallback | None) -> bytes:
+    _require_cover_size(cover_path)
     with wave.open(cover_path, "rb") as reader:
+        _validate_wav_reader(reader)
         frames = reader.readframes(reader.getnframes())
     return _read_container_from_region(frames, 0, len(frames), _carrier_secret(password, stego_key), progress)
 
@@ -421,13 +456,18 @@ def _embed_png(
     options: EmbedOptions,
     progress: ProgressCallback | None,
 ) -> None:
-    image = read_png(cover_path)
+    _require_cover_size(cover_path)
+    try:
+        image = read_png(cover_path)
+    except PngError as exc:
+        raise StegoError(str(exc)) from exc
     pixels = bytearray(image.pixels)
     _write_bits(pixels, 0, len(pixels), container, options, progress, 25, 92)
     _atomic_write_with(Path(output_path), lambda temp_path: write_png(image.with_pixels(bytes(pixels)), temp_path))
 
 
 def _extract_png(cover_path: str, password: str, stego_key: str, progress: ProgressCallback | None) -> bytes:
+    _require_cover_size(cover_path)
     image = read_png(cover_path)
     return _read_container_from_region(image.pixels, 0, len(image.pixels), _carrier_secret(password, stego_key), progress)
 
@@ -463,7 +503,11 @@ def _embed_jpeg_dct(
 
 
 def _embed_flac(cover_path: str, output_path: str, container: bytes) -> None:
-    _atomic_write_with(Path(output_path), lambda temp_path: embed_flac_container(cover_path, temp_path, container))
+    _require_cover_size(cover_path)
+    try:
+        _atomic_write_with(Path(output_path), lambda temp_path: embed_flac_container(cover_path, temp_path, container))
+    except FlacCodecError as exc:
+        raise StegoError(str(exc)) from exc
 
 
 def _extract_jpeg_dct(cover_path: str, password: str, stego_key: str, progress: ProgressCallback | None) -> bytes:
@@ -520,7 +564,7 @@ def _write_bits(
     required_bits = len(stream) * 8
     if required_bits > len(carrier_indexes):
         capacity = len(carrier_indexes) // 8
-        raise CapacityError(f"Payload is too large for this cover. Exact capacity is {capacity:,} bytes.")
+        raise CapacityError(f"Payload is too large for this cover. Estimated usable capacity is {capacity:,} bytes.")
 
     for bit_index, bit in enumerate(_iter_bits(prefix)):
         carrier = prefix_indexes[bit_index]
@@ -600,6 +644,12 @@ def _carrier_indexes(
     seed_salt: bytes,
     density: str = "maximum",
 ) -> list[int]:
+    span = max(0, stop - start)
+    if span > MAX_CARRIER_INDEXES:
+        raise StegoError(
+            f"Cover carrier region is too large ({span:,} bytes). "
+            f"Maximum supported carrier region is {MAX_CARRIER_INDEXES:,} bytes."
+        )
     if not adaptive:
         indexes = list(range(start, stop))
     else:
@@ -618,12 +668,18 @@ def _carrier_indexes(
 
 
 def _carrier_seed(password: str, salt: bytes) -> int:
-    seed = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000, dklen=32)
+    import unicodedata
+
+    normalized = unicodedata.normalize("NFKC", password or "")
+    seed = hashlib.pbkdf2_hmac("sha256", normalized.encode("utf-8"), salt, 120_000, dklen=32)
     return int.from_bytes(seed, "big")
 
 
 def _carrier_secret(password: str, stego_key: str = "") -> str:
-    return stego_key or password
+    import unicodedata
+
+    secret = stego_key or password or ""
+    return unicodedata.normalize("NFKC", secret)
 
 
 def _normalize_density(density: str) -> str:
@@ -684,33 +740,74 @@ def _supported_cover_message() -> str:
 def _bmp_pixel_offset(data: bytes | bytearray) -> int:
     if len(data) < 54 or data[:2] != b"BM":
         raise StegoError("The selected BMP file is invalid.")
+    header_size = struct.unpack("<I", data[14:18])[0]
+    if header_size < 40:
+        raise StegoError("The selected BMP file uses an unsupported DIB header.")
+    bits_per_pixel = struct.unpack("<H", data[28:30])[0]
+    compression = struct.unpack("<I", data[30:34])[0]
+    if bits_per_pixel not in {8, 16, 24, 32}:
+        raise StegoError("BMP support is limited to 8/16/24/32-bit images.")
+    if compression not in {0, 3}:
+        raise StegoError("Compressed BMP files are not supported.")
     offset = struct.unpack("<I", data[10:14])[0]
-    if offset >= len(data):
+    if offset >= len(data) or offset < 14 + header_size:
         raise StegoError("The selected BMP file has an invalid pixel offset.")
     return offset
 
 
-def _bmp_carrier_count(path: str, adaptive: bool, density: str = "maximum") -> int:
+def _validate_wav_reader(reader: wave.Wave_read) -> None:
+    try:
+        width = reader.getsampwidth()
+        comptype = reader.getcomptype()
+    except wave.Error as exc:
+        raise StegoError(f"Unsupported or invalid WAV file: {exc}") from exc
+    if comptype not in {"NONE", "not compressed"}:
+        raise StegoError("Only uncompressed PCM WAV files are supported.")
+    if width not in {1, 2, 3, 4}:
+        raise StegoError("WAV sample width must be 8, 16, 24, or 32 bits.")
+
+
+def _require_cover_size(path: str) -> None:
+    size = Path(path).stat().st_size
+    if size > MAX_COVER_BYTES:
+        raise StegoError(
+            f"Cover file is too large ({size:,} bytes). "
+            f"Maximum supported cover size is {MAX_COVER_BYTES:,} bytes."
+        )
+
+
+def _bmp_carrier_count(path: str, adaptive: bool, density: str = "maximum", spread: bool = False) -> int:
+    _require_cover_size(path)
     data = Path(path).read_bytes()
     offset = _bmp_pixel_offset(data)
-    if not adaptive:
-        return len(_carrier_indexes(data, offset + PREFIX_SIZE * 8, len(data), False, False, "", b"\0" * SEED_SIZE, density))
-    return len(_carrier_indexes(data, offset + PREFIX_SIZE * 8, len(data), True, False, "", b"\0" * SEED_SIZE, density))
+    return len(
+        _carrier_indexes(
+            data,
+            offset + PREFIX_SIZE * 8,
+            len(data),
+            adaptive,
+            spread,
+            "",
+            b"\0" * SEED_SIZE,
+            density,
+        )
+    )
 
 
-def _wav_carrier_count(path: str, adaptive: bool, density: str = "maximum") -> int:
+def _wav_carrier_count(path: str, adaptive: bool, density: str = "maximum", spread: bool = False) -> int:
+    _require_cover_size(path)
     with wave.open(path, "rb") as reader:
+        _validate_wav_reader(reader)
         frames = reader.readframes(reader.getnframes())
-    if not adaptive:
-        return len(_carrier_indexes(frames, PREFIX_SIZE * 8, len(frames), False, False, "", b"\0" * SEED_SIZE, density))
-    return len(_carrier_indexes(frames, PREFIX_SIZE * 8, len(frames), True, False, "", b"\0" * SEED_SIZE, density))
+    return len(_carrier_indexes(frames, PREFIX_SIZE * 8, len(frames), adaptive, spread, "", b"\0" * SEED_SIZE, density))
 
 
-def _png_carrier_count(path: str, adaptive: bool, density: str = "maximum") -> int:
+def _png_carrier_count(path: str, adaptive: bool, density: str = "maximum", spread: bool = False) -> int:
+    _require_cover_size(path)
     image = read_png(path)
-    if not adaptive:
-        return len(_carrier_indexes(image.pixels, PREFIX_SIZE * 8, len(image.pixels), False, False, "", b"\0" * SEED_SIZE, density))
-    return len(_carrier_indexes(image.pixels, PREFIX_SIZE * 8, len(image.pixels), True, False, "", b"\0" * SEED_SIZE, density))
+    return len(
+        _carrier_indexes(image.pixels, PREFIX_SIZE * 8, len(image.pixels), adaptive, spread, "", b"\0" * SEED_SIZE, density)
+    )
 
 
 def _safe_filename(filename: str) -> str:

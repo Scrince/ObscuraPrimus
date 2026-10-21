@@ -11,17 +11,17 @@ import sqlite3
 import stat
 import struct
 import subprocess
+import sys
 import tarfile
 import time
 import zlib
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 from .file_analysis import (
     FileAnalysis,
+    _iter_scan_files,
     analyze_file,
-    analyze_path,
     carve_embedded_files,
     entropy,
     error_analysis,
@@ -30,9 +30,8 @@ from .file_analysis import (
     hash_bytes,
     hex_preview,
 )
-from .runtime import portable_data_dir
 from .plugins import run_matching_plugins
-
+from .runtime import portable_data_dir
 
 SCAN_PROFILES = {
     "quick": {"deep": False, "timeout": 10, "max_file_mb": 64},
@@ -42,6 +41,8 @@ SCAN_PROFILES = {
 }
 
 SIGMA_PATTERN = re.compile(r"(?im)^\s*(title|id|logsource|detection|condition)\s*:")
+MAX_ARCHIVE_MEMBERS = 10_000
+MAX_ARCHIVE_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -74,36 +75,138 @@ def analyze_path_isolated(
     profile: str = "deep",
     yara_rules: str = "",
     progress=None,
+    cancel=None,
 ) -> list[FileAnalysis]:
     settings = SCAN_PROFILES.get(profile, SCAN_PROFILES["deep"])
     root = Path(target)
-    files = [root] if root.is_file() else [p for p in (root.rglob("*") if recursive else root.glob("*")) if p.is_file()]
     results: list[FileAnalysis] = []
-    total = max(1, len(files))
-    for index, file_path in enumerate(files, start=1):
+    for index, file_path in enumerate(_iter_scan_files(root, recursive), start=1):
+        if cancel and cancel():
+            break
         try:
             guard_file_size(file_path, int(settings["max_file_mb"]))
-            executor = ThreadPoolExecutor(max_workers=1)
-            try:
-                future = executor.submit(analyze_file, file_path, bool(settings["deep"]), yara_rules)
-                analysis = future.result(timeout=int(settings["timeout"]))
-                plugin_results = run_matching_plugins(file_path, timeout=int(settings["timeout"]))
-                if plugin_results:
-                    analysis.metadata["plugin_results"] = plugin_results
-                    for plugin_result in plugin_results:
-                        for finding in plugin_result.get("findings", []):
-                            analysis.suspicious.append(f"Plugin {plugin_result.get('plugin')}: {finding}")
-                        analysis.risk_score = min(100, analysis.risk_score + int(plugin_result.get("risk_delta", 0) or 0))
-                results.append(analysis)
-            finally:
-                executor.shutdown(wait=False, cancel_futures=True)
-        except TimeoutError:
-            results.append(error_analysis(file_path, TimeoutError(f"Analyzer timed out after {settings['timeout']} seconds.")))
+            analysis = _analyze_file_process(
+                file_path,
+                deep=bool(settings["deep"]),
+                yara_rules=yara_rules,
+                timeout=int(settings["timeout"]),
+            )
+            plugin_results = run_matching_plugins(file_path, timeout=int(settings["timeout"]))
+            if plugin_results:
+                analysis.metadata["plugin_results"] = plugin_results
+                for plugin_result in plugin_results:
+                    for finding in plugin_result.get("findings", []):
+                        analysis.suspicious.append(f"Plugin {plugin_result.get('plugin')}: {finding}")
+                    analysis.risk_score = min(100, analysis.risk_score + int(plugin_result.get("risk_delta", 0) or 0))
+            results.append(analysis)
+        except TimeoutError as exc:
+            results.append(error_analysis(file_path, exc))
         except Exception as exc:
             results.append(error_analysis(file_path, exc))
         if progress:
-            progress(int(index * 100 / total), str(file_path))
+            progress(min(99, index), str(file_path))
+    if progress:
+        progress(100, str(root))
     return results
+
+
+ANALYZER_WORKER_FLAG = "--obp-analyze-worker"
+
+_ANALYZER_RUNNER = r"""
+import json
+import sys
+from dataclasses import asdict
+from obscuraprimus.file_analysis import analyze_file
+
+path = sys.argv[1]
+deep = sys.argv[2] == "1"
+yara = sys.argv[3] if len(sys.argv) > 3 else ""
+out = sys.argv[4] if len(sys.argv) > 4 else ""
+result = analyze_file(path, deep=deep, yara_rules=yara)
+payload = json.dumps(asdict(result), sort_keys=True)
+if out:
+    open(out, "w", encoding="utf-8").write(payload)
+else:
+    print(payload)
+"""
+
+
+def maybe_run_analyze_worker(argv: list[str] | None = None) -> bool:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args[0] != ANALYZER_WORKER_FLAG:
+        return False
+    if len(args) < 4:
+        raise SystemExit("Usage: --obp-analyze-worker <path> <0|1> <yara> <output.json>")
+    path, deep_flag, yara, out_path = args[1], args[2], args[3], args[4] if len(args) > 4 else ""
+    if not out_path:
+        raise SystemExit("Analyzer worker requires an output JSON path.")
+
+    result = analyze_file(path, deep=deep_flag == "1", yara_rules=yara)
+    Path(out_path).write_text(json.dumps(asdict(result), sort_keys=True), encoding="utf-8")
+    return True
+
+
+def _analyze_file_process(path: Path, deep: bool, yara_rules: str, timeout: int) -> FileAnalysis:
+    import tempfile
+
+    fd, out_name = tempfile.mkstemp(prefix="obp-analyze-", suffix=".json")
+    os.close(fd)
+    out_path = Path(out_name)
+    try:
+        if getattr(sys, "frozen", False):
+            command = [
+                sys.executable,
+                ANALYZER_WORKER_FLAG,
+                str(path),
+                "1" if deep else "0",
+                yara_rules or "",
+                str(out_path),
+            ]
+            env = os.environ.copy()
+        else:
+            env = os.environ.copy()
+            root = str(Path(__file__).resolve().parents[1])
+            pythonpath = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = root if not pythonpath else root + os.pathsep + pythonpath
+            command = [
+                sys.executable,
+                "-c",
+                _ANALYZER_RUNNER,
+                str(path),
+                "1" if deep else "0",
+                yara_rules or "",
+                str(out_path),
+            ]
+        try:
+            completed = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"Analyzer timed out after {timeout} seconds.") from exc
+        if completed.returncode:
+            detail = (completed.stderr or completed.stdout or "Analyzer subprocess failed.").strip()
+            raise RuntimeError(detail)
+        try:
+            payload = json.loads(out_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Analyzer subprocess returned invalid JSON.") from exc
+        return _file_analysis_from_dict(payload)
+    finally:
+        try:
+            out_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _file_analysis_from_dict(payload: dict) -> FileAnalysis:
+    allowed = {field.name for field in fields(FileAnalysis)}
+    clean = {key: value for key, value in payload.items() if key in allowed}
+    return FileAnalysis(**clean)
 
 
 def scan_yara_details(target: str | Path, rule_path: str | Path) -> list[YaraMatch]:
@@ -118,7 +221,6 @@ def scan_yara_details(target: str | Path, rule_path: str | Path) -> list[YaraMat
         return _parse_yara_output(result.stdout, str(target_path))
     rule_names = validation.get("rules", [])
     haystack = target_path.read_bytes() if target_path.is_file() else b""
-    strings = extract_strings(haystack)
     matches = []
     for rule in rule_names:
         if rule.lower().encode() in haystack.lower():
@@ -175,8 +277,14 @@ def search_case(case_dir: str | Path, query: str) -> list[dict]:
         data = dict(row)
         searchable = " ".join(str(value) for value in data.values()).lower()
         path = Path(data.get("path", ""))
-        if needle in searchable or (path.exists() and needle in _safe_file_search_blob(path)):
+        if needle in searchable:
             results.append(data)
+            continue
+        try:
+            if path.is_file() and path.stat().st_size <= 1024 * 1024 and needle in _safe_file_search_blob(path):
+                results.append(data)
+        except OSError:
+            continue
     return results
 
 
@@ -189,11 +297,17 @@ def import_immutable_evidence(case_dir: str | Path, source: str | Path, tags: li
     evidence_dir = root / "evidence"
     evidence_dir.mkdir(parents=True, exist_ok=True)
     digest = _hash_file(source_path)
-    target = evidence_dir / f"{digest[:16]}_{source_path.name}"
+    safe_name = re.sub(r"[^\w.\-]+", "_", source_path.name) or "evidence.bin"
+    target = evidence_dir / f"{digest[:16]}_{safe_name}"
     if not target.exists():
         shutil.copy2(source_path, target)
+    if target.stat().st_size != source_path.stat().st_size or _hash_file(target) != digest:
+        raise ValueError("Evidence copy verification failed after import.")
     try:
-        target.chmod(stat.S_IREAD)
+        if os.name == "nt":
+            target.chmod(stat.S_IREAD)
+        else:
+            target.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
     except OSError:
         pass
     add_evidence_record(root, str(target), digest, target.stat().st_size, tags or ["immutable"], notes)
@@ -203,6 +317,7 @@ def import_immutable_evidence(case_dir: str | Path, source: str | Path, tags: li
 
 def export_case_bundle(case_dir: str | Path, output_path: str | Path, sign: bool = False) -> dict:
     root = Path(case_dir)
+    verify_immutable_evidence(root)
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(output, "w:gz") as archive:
@@ -220,10 +335,36 @@ def import_case_bundle(bundle_path: str | Path, output_dir: str | Path) -> dict:
     bundle = Path(bundle_path)
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
+    if bundle.stat().st_size > MAX_ARCHIVE_EXPANDED_BYTES:
+        raise ValueError("Case bundle exceeds the 2 GiB compressed-size limit.")
     digest = _hash_file(bundle)
     with tarfile.open(bundle, "r:gz") as archive:
         _safe_extract_tar(archive, destination)
     return {"bundle": str(bundle), "output_dir": str(destination), "sha256": digest}
+
+
+def verify_immutable_evidence(case_dir: str | Path) -> list[dict]:
+    database = Path(case_dir) / "case.db"
+    if not database.exists():
+        return []
+    con = sqlite3.connect(database)
+    try:
+        records = con.execute("select path, sha256, size from evidence").fetchall()
+    finally:
+        con.close()
+    errors = []
+    for evidence_path, expected_hash, expected_size in records:
+        path = Path(evidence_path)
+        try:
+            actual_size = path.stat().st_size
+            actual_hash = _hash_file(path)
+            if actual_size != expected_size or actual_hash.lower() != str(expected_hash).lower():
+                errors.append({"path": str(path), "valid": False, "reason": "size or SHA-256 mismatch"})
+        except OSError as exc:
+            errors.append({"path": str(path), "valid": False, "reason": str(exc)})
+    if errors:
+        raise ValueError(f"Immutable evidence verification failed for {len(errors)} record(s): {errors[0]['path']}")
+    return [{"path": str(path), "valid": True} for path, _, _ in records]
 
 
 def inspect_raw_image(path: str | Path, sample_mb: int = 16) -> dict:
@@ -608,7 +749,8 @@ def _try_gzip_preview(data: bytes) -> str:
     if start == -1:
         return ""
     try:
-        return gzip.decompress(data[start:])[:1000].decode("utf-8", errors="replace")
+        with gzip.GzipFile(fileobj=__import__("io").BytesIO(data[start:start + 256 * 1024])) as handle:
+            return handle.read(1000).decode("utf-8", errors="replace")
     except Exception:
         return ""
 
@@ -619,7 +761,9 @@ def _try_zlib_preview(data: bytes) -> str:
         if start == -1:
             continue
         try:
-            return zlib.decompress(data[start:])[:1000].decode("utf-8", errors="replace")
+            decompressor = zlib.decompressobj()
+            output = decompressor.decompress(data[start : start + 256 * 1024], max_length=1000)
+            return output.decode("utf-8", errors="replace")
         except Exception:
             continue
     return ""
@@ -636,12 +780,50 @@ def _xor_ascii_previews(data: bytes) -> list[dict]:
 
 
 def _safe_extract_tar(archive: tarfile.TarFile, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
     root = destination.resolve()
-    for member in archive.getmembers():
-        target = (destination / member.name).resolve()
+    validated_members = []
+    members = []
+    expanded_size = 0
+    for member in archive:
+        members.append(member)
+        if len(members) > MAX_ARCHIVE_MEMBERS:
+            raise ValueError(f"Case bundle exceeds the {MAX_ARCHIVE_MEMBERS:,} member limit.")
+        if member.issym() or member.islnk():
+            raise ValueError("Symbolic or hard links are not allowed in case bundles.")
+        if not (member.isfile() or member.isdir()):
+            raise ValueError(f"Unsupported tar member type: {member.name}")
+        expanded_size += max(0, member.size)
+        if expanded_size > MAX_ARCHIVE_EXPANDED_BYTES:
+            raise ValueError("Case bundle exceeds the 2 GiB expanded-size limit.")
+        member_path = Path(member.name.replace("\\", "/"))
+        if member_path.is_absolute() or re.match(r"^[A-Za-z]:", member.name):
+            raise ValueError("Absolute paths are not allowed in case bundles.")
+        if ".." in member_path.parts:
+            raise ValueError("Unsafe path in case bundle.")
+        target = (root / member_path).resolve()
         if root not in target.parents and target != root:
             raise ValueError("Unsafe path in case bundle.")
-    archive.extractall(destination)
+        validated_members.append(member)
+    for member in validated_members:
+        target = (root / Path(member.name.replace("\\", "/"))).resolve()
+        if member.isdir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source = archive.extractfile(member)
+        if source is None:
+            raise ValueError(f"Unable to read tar member: {member.name}")
+        with source, target.open("wb") as output:
+            copied = 0
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > member.size or copied > MAX_ARCHIVE_EXPANDED_BYTES:
+                    raise ValueError(f"Case bundle member exceeds its declared size: {member.name}")
+                output.write(chunk)
 
 
 def _embedded_chart_html(results: list[FileAnalysis]) -> str:

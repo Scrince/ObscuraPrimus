@@ -180,3 +180,7 @@ Copy that executable to a USB drive along with any files you want to process. No
 - Stego output should keep the same format as the cover file.
 - Adaptive/spread mode is self-describing, but password-derived carrier ordering means the same password is needed when those modes are used with encryption.
 - Wrong passwords or corrupted payloads are reported as extraction errors.
+
+## Windows installer
+
+See [Windows installer and signature verification](docs/WINDOWS_INSTALLER.md) for the download path and verification steps.

@@ -9,10 +9,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from obscuraprimus.signing import ensure_release_key, export_public_key, make_config, release_fingerprint, sign_file
-
-
 def main(argv: list[str] | None = None) -> int:
+    from obscuraprimus.signing import ensure_release_key, export_public_key, make_config, release_fingerprint, sign_file
+
     parser = argparse.ArgumentParser(description="Manage ObscuraPrimus release PGP signatures.")
     parser.add_argument("--gpg-exe", default="")
     parser.add_argument("--gpg-home", default="")
@@ -22,7 +21,7 @@ def main(argv: list[str] | None = None) -> int:
     ensure = subcommands.add_parser("ensure-key")
     ensure.add_argument("--public-key", required=True)
 
-    fingerprint = subcommands.add_parser("fingerprint")
+    subcommands.add_parser("fingerprint")
 
     sign = subcommands.add_parser("sign")
     sign.add_argument("artifact", nargs="+")

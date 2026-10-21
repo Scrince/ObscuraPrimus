@@ -13,7 +13,7 @@ env/
 build/
 dist/
 *.spec~
-release/
+release/*
 .gnupg-release/
 assets/
 *.asc
@@ -41,6 +41,18 @@ Thumbs.db
 .smoke/
 ObscuraPrimusData/
 
-# Windows shortcuts
-*.lnk
+# Windows installer release assets
+!docs/WINDOWS_INSTALLER.md.asc
+!release/
+!release/windows/
+!release/windows/ObscuraPrimus-Setup-1.0.0.exe
+!release/windows/ObscuraPrimus-Setup-1.0.0.exe.asc
+!release/windows/SHA256SUMS
+!release/windows/SHA256SUMS.asc
+!release/ObscuraPrimus-1.0.0-windows-x64/
+!release/ObscuraPrimus-1.0.0-windows-x64/ObscuraPrimus.exe
+!release/ObscuraPrimus-1.0.0-windows-x64/*.asc
 
+
+# Local machine shortcut (not part of the project)
+/.github/Data (T).lnk

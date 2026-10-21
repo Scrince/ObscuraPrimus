@@ -32,10 +32,10 @@ from .advanced_analysis import (
     write_example_plugin,
     write_report_template,
 )
-from .case_db import create_finding, dashboard as case_dashboard, search_fts, store_analysis_results, update_finding
+from .case_db import create_finding, search_fts, store_analysis_results, update_finding
+from .case_db import dashboard as case_dashboard
 from .file_analysis import (
     add_evidence,
-    analyze_path,
     carve_embedded_files,
     compare_files,
     create_case,
@@ -56,6 +56,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return _main(argv)
     except StegoError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, RuntimeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
@@ -93,7 +96,7 @@ def _main(argv: list[str] | None = None) -> int:
     )
     extract.add_argument("--stego-key", default="")
 
-    capacity = subcommands.add_parser("capacity", help="Show exact carrier capacity")
+    capacity = subcommands.add_parser("capacity", help="Estimate usable payload capacity")
     capacity.add_argument("--cover", required=True)
     capacity.add_argument("--adaptive", action="store_true")
     capacity.add_argument("--spread", action="store_true")
@@ -199,13 +202,13 @@ def _main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     def resolve_password(required: bool) -> str:
-        
         env_name = getattr(args, "password_env", "OBSCURAPRIMUS_PASSWORD") or "OBSCURAPRIMUS_PASSWORD"
         from_env = os.environ.get(env_name, "")
         if from_env:
             return from_env
-        if not required and args.command == "scan":
-            
+        if not required:
+            if args.command == "scan":
+                return ""
             if sys.stdin.isatty():
                 try:
                     return getpass.getpass("Password (leave empty if none): ")
@@ -228,6 +231,16 @@ def _main(argv: list[str] | None = None) -> int:
             password = resolve_password(required=True)
             if not password:
                 raise SystemExit("Error: a password is required when encryption is enabled.")
+        else:
+            print(
+                "Warning: embedding without encryption can expose the hidden file if discovered.",
+                file=sys.stderr,
+            )
+        if (args.adaptive or args.spread) and not args.stego_key and (args.encryption == "None" or not password):
+            print(
+                "Warning: adaptive/spread without a password or stego key does not keep carrier order secret.",
+                file=sys.stderr,
+            )
         embed_file(
             args.cover,
             args.secret,
@@ -248,7 +261,7 @@ def _main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "extract":
         out = Path(args.out)
-        password = resolve_password(required=True)
+        password = resolve_password(required=False)
         extract_file(args.cover, str(out.parent), password, out.name, args.stego_key, _print_progress)
         return 0
     if args.command == "capacity":
@@ -342,7 +355,8 @@ def _main(argv: list[str] | None = None) -> int:
         strip_jpeg_exif(args.input, args.output)
         return 0
     if args.command == "vt":
-        print(json.dumps(virustotal_lookup(args.sha256, args.api_key), indent=2, sort_keys=True))
+        api_key = args.api_key or os.environ.get("OBSCURAPRIMUS_VT_API_KEY") or os.environ.get("VT_API_KEY") or ""
+        print(json.dumps(virustotal_lookup(args.sha256, api_key), indent=2, sort_keys=True))
         return 0
     if args.command == "health":
         print(json.dumps(portable_health(), indent=2, sort_keys=True))

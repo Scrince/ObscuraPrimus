@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -43,7 +45,20 @@ class JobQueue:
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps([asdict(job) for job in self.jobs], indent=2), encoding="utf-8")
+        payload = json.dumps([asdict(job) for job in self.jobs], indent=2)
+        fd, temp_name = tempfile.mkstemp(prefix=".jobs.", suffix=".tmp", dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, self.path)
+        except Exception:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+            raise
 
     def _load(self) -> list[JobRecord]:
         if not self.path.exists():

@@ -24,18 +24,36 @@ class CarrierCodec:
             return bool(self.implemented())
         return self.implemented
 
-    def capacity(self, path: str | Path, adaptive: bool = False, spread: bool = False) -> int:
+    def capacity(
+        self,
+        path: str | Path,
+        adaptive: bool = False,
+        spread: bool = False,
+        density: str = "maximum",
+    ) -> int:
         if not self.is_available():
             raise NotImplementedError(self.notes)
-        return estimate_capacity(str(path), adaptive, spread)
+        return estimate_capacity(str(path), adaptive, spread, density)
 
 
 CODECS = (
     CarrierCodec("BMP", (".bmp",), True, True, "Raw bitmap carrier bytes."),
     CarrierCodec("PNG", (".png",), True, True, "Lossless 8-bit non-interlaced PNG pixel carrier bytes."),
     CarrierCodec("WAV", (".wav",), True, True, "PCM audio frame carrier bytes."),
-    CarrierCodec("JPEG-DCT", (".jpg", ".jpeg"), False, backend_available, "Requires OBSCURAPRIMUS_JPEG_DCT_BACKEND coefficient-domain backend."),
-    CarrierCodec("FLAC", (".flac",), True, True, "FLAC APPLICATION metadata block carrier that preserves audio frames."),
+    CarrierCodec(
+        "JPEG-DCT",
+        (".jpg", ".jpeg"),
+        False,
+        backend_available,
+        "Requires OBSCURAPRIMUS_JPEG_DCT_BACKEND coefficient-domain backend.",
+    ),
+    CarrierCodec(
+        "FLAC",
+        (".flac",),
+        True,
+        True,
+        "FLAC APPLICATION metadata block carrier that preserves audio frames (not LSB stego).",
+    ),
 )
 
 

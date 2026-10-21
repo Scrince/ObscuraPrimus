@@ -4,7 +4,6 @@ import importlib.metadata as metadata
 import json
 from pathlib import Path
 
-
 PROJECT_PACKAGES = ["PySide6", "cryptography", "pyinstaller"]
 
 

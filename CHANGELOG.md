@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Hardened PNG inflate against zip-bomb style payloads and capped cover/carrier sizes.
+- Mapped FLAC/PNG/JPEG codec failures to clean `StegoError` CLI/GUI errors.
+- Process-isolated file analysis with killable timeouts (including frozen EXE worker mode).
+- FLAC forensic detection for ObscuraPrimus APPLICATION metadata blocks.
+- Hardened case-bundle tar import against path traversal and link members.
+- Deduplicated case findings on re-analysis; quieter case-db audit logging.
+- JPEG-DCT backend secrets passed via env/temp file instead of process argv.
+- CLI/GUI warnings for unencrypted embed and secretless adaptive/spread modes.
+- Password NFKC normalization, VirusTotal API key via environment, denser carrier capacity API.
+- UI focus modes: stego-only, forensics-only, or full (restart after Settings change).
+- Network update checks default off; opt-in via Settings (`allow_network_updates`).
+- JPEG-DCT demoted to experimental optional backend messaging (production carriers: BMP/PNG/WAV/FLAC).
 - Added guided embed presets and a live security summary in the GUI.
 - Blocked weak encryption passwords before embed operations.
 - Added streaming hashes, entropy, byte search, and file comparison for large evidence files.

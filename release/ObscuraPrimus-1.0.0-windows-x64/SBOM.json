@@ -1,0 +1,30 @@
+{
+  "bomFormat": "CycloneDX-lite",
+  "components": [
+    {
+      "license": "LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only",
+      "name": "PySide6",
+      "summary": "Python bindings for the Qt cross-platform application and UI framework",
+      "version": "6.11.1"
+    },
+    {
+      "license": "Apache-2.0 OR BSD-3-Clause",
+      "name": "cryptography",
+      "summary": "cryptography is a package which provides cryptographic recipes and primitives to Python developers.",
+      "version": "49.0.0"
+    },
+    {
+      "license": "GPLv2-or-later with a special exception which allows to use PyInstaller to build and distribute non-free programs (including commercial ones)",
+      "name": "pyinstaller",
+      "summary": "PyInstaller bundles a Python application and all its dependencies into a single package.",
+      "version": "6.21.0"
+    }
+  ],
+  "metadata": {
+    "component": {
+      "name": "ObscuraPrimus",
+      "version": "1.0.0"
+    }
+  },
+  "specVersion": "1.0"
+}

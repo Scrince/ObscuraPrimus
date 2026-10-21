@@ -8,14 +8,16 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
+OutputDir=..\release\windows
 OutputBaseFilename=ObscuraPrimus-Setup-{#MyAppVersion}
 Compression=lzma
 SolidCompression=yes
+PrivilegesRequired=lowest
 WizardStyle=modern
 SetupIconFile=..\assets\ico\windows\SteganographyAnalyzer.ico
 
 [Files]
-Source: "..\release\ObscuraPrimus-1.0.0-windows-x64\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
+Source: "..\release\ObscuraPrimus-1.0.0-windows-x64\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs; Excludes: "ObscuraPrimusData\*;*.asc"
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

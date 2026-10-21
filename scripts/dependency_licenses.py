@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.metadata as metadata
 from pathlib import Path
 
-
 PROJECT_PACKAGES = ["PySide6", "cryptography", "pyinstaller"]
 
 

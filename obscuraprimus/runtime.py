@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import time
 from pathlib import Path
-
 
 APP_DIR_NAME = "ObscuraPrimusData"
 DEFAULT_CONFIG = {
@@ -15,6 +15,8 @@ DEFAULT_CONFIG = {
     "default_spread": False,
     "first_run_complete": False,
     "update_repo": "The-Swarm-Corporation/ObscuraPrimus",
+    "allow_network_updates": False,
+    "ui_mode": "full",
 }
 
 
@@ -48,7 +50,17 @@ def load_config() -> dict:
         loaded = json.loads(path.read_text(encoding="utf-8"))
         return _validate_config(loaded)
     except (OSError, json.JSONDecodeError):
-        return dict(DEFAULT_CONFIG)
+        try:
+            backup = path.with_suffix(f".corrupt.{int(time.time())}.json")
+            path.replace(backup)
+        except OSError:
+            pass
+        config = dict(DEFAULT_CONFIG)
+        try:
+            save_config(config)
+        except OSError:
+            pass
+        return config
 
 
 def save_config(config: dict) -> None:
@@ -74,11 +86,14 @@ def _validate_config(config: dict) -> dict:
         clean["theme"] = config["theme"]
     if isinstance(config.get("last_directory"), str):
         clean["last_directory"] = config["last_directory"]
-    for key in ("default_compress", "default_adaptive", "default_spread"):
+    for key in ("default_compress", "default_adaptive", "default_spread", "allow_network_updates"):
         if isinstance(config.get(key), bool):
             clean[key] = config[key]
     if isinstance(config.get("first_run_complete"), bool):
         clean["first_run_complete"] = config["first_run_complete"]
     if isinstance(config.get("update_repo"), str):
         clean["update_repo"] = config["update_repo"].strip()
+    mode = config.get("ui_mode")
+    if mode in {"stego", "forensics", "full"}:
+        clean["ui_mode"] = mode
     return clean

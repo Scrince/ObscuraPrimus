@@ -1,16 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import os
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 
 
 class JpegDctError(ValueError):
     pass
+
+
+SEED_ENV = "OBSCURAPRIMUS_JPEG_DCT_SEED"
 
 
 @dataclass(frozen=True)
@@ -53,21 +57,21 @@ def backend_available() -> bool:
 
 def backend_unavailable_message() -> str:
     return (
-        "JPEG-DCT carrier support is unavailable because OBSCURAPRIMUS_JPEG_DCT_BACKEND "
-        "does not point to an installed coefficient-domain backend. Use BMP, PNG, WAV, "
-        "or FLAC, or configure the JPEG backend before using .jpg/.jpeg carriers. "
+        "JPEG-DCT is an experimental optional backend (not a production carrier). "
+        "Support is unavailable because OBSCURAPRIMUS_JPEG_DCT_BACKEND does not point "
+        "to an installed coefficient-domain tool. Use BMP, PNG, WAV, or FLAC instead. "
         "Unsafe JPEG byte-level LSB mutation is intentionally disabled."
     )
 
 
 def embed_with_backend(cover_path: str | Path, output_path: str | Path, container_path: str | Path, password_seed: str = "") -> None:
     require_dct_backend()
-    _run_backend(["embed", str(cover_path), str(container_path), str(output_path), password_seed])
+    _run_backend(["embed", str(cover_path), str(container_path), str(output_path)], seed=password_seed)
 
 
 def extract_with_backend(stego_path: str | Path, container_path: str | Path, password_seed: str = "") -> None:
     require_dct_backend()
-    _run_backend(["extract", str(stego_path), str(container_path), password_seed])
+    _run_backend(["extract", str(stego_path), str(container_path)], seed=password_seed)
 
 
 def capacity_with_backend(path: str | Path) -> int:
@@ -79,11 +83,35 @@ def capacity_with_backend(path: str | Path) -> int:
         raise JpegDctError(f"JPEG DCT backend returned an invalid capacity: {result!r}") from exc
 
 
-def _run_backend(args: list[str], capture: bool = False) -> str:
+def _run_backend(args: list[str], capture: bool = False, seed: str = "") -> str:
     command = _backend_command_parts()
     if not command:
         raise JpegDctError("OBSCURAPRIMUS_JPEG_DCT_BACKEND is not configured.")
-    result = subprocess.run([*command, *args], text=True, capture_output=True, timeout=300)
+    env = os.environ.copy()
+    seed_path = None
+    if seed:
+        fd, seed_path = tempfile.mkstemp(prefix="obp-jpeg-seed-", suffix=".txt")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(seed)
+            env[SEED_ENV] = seed_path
+            env.pop("OBSCURAPRIMUS_JPEG_DCT_PASSWORD", None)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            if seed_path:
+                Path(seed_path).unlink(missing_ok=True)
+            raise
+    try:
+        result = subprocess.run([*command, *args], text=True, capture_output=True, timeout=300, env=env)
+    finally:
+        if seed_path:
+            try:
+                Path(seed_path).unlink(missing_ok=True)
+            except OSError:
+                pass
     if result.returncode:
         raise JpegDctError((result.stderr or result.stdout or "JPEG DCT backend failed.").strip())
     return result.stdout if capture else ""

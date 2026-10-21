@@ -5,7 +5,6 @@ import sqlite3
 import time
 from pathlib import Path
 
-
 SCHEMA = """
 create table if not exists evidence (
   id integer primary key autoincrement,
@@ -95,11 +94,13 @@ def init_case_db(case_dir: str | Path) -> Path:
     root = Path(case_dir)
     root.mkdir(parents=True, exist_ok=True)
     db_path = root / "case.db"
+    created = not db_path.exists()
     con = sqlite3.connect(db_path)
     try:
         con.executescript(SCHEMA)
         _ensure_fts(con)
-        con.execute("insert into audit(timestamp, message) values (?, ?)", (time.time(), "case-db-opened"))
+        if created:
+            con.execute("insert into audit(timestamp, message) values (?, ?)", (time.time(), "case-db-created"))
         con.commit()
     finally:
         con.close()
@@ -200,7 +201,14 @@ def store_analysis_results(case_dir: str | Path, results) -> None:
                 )
             if item.suspicious:
                 for flag in item.suspicious:
-                    add_finding(con, file_id, flag[:120], flag, severity_from_score(item.risk_score))
+                    title = flag[:120]
+                    existing = con.execute(
+                        "select id from findings where file_id = ? and title = ? and status != 'closed'",
+                        (file_id, title),
+                    ).fetchone()
+                    if existing:
+                        continue
+                    add_finding(con, file_id, title, flag, severity_from_score(item.risk_score))
             _index_fts(con, file_id, item)
         con.execute("insert into audit(timestamp, message) values (?, ?)", (time.time(), f"analysis-stored {len(results)} files"))
         con.commit()

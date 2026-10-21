@@ -123,6 +123,27 @@ class FileAnalysisTests(unittest.TestCase):
         strings = extract_strings("secret".encode("utf-16le"))
         self.assertIn("secret", strings)
 
+    def test_analysis_rejects_file_over_shared_size_limit(self):
+        from unittest import mock
+
+        from obscuraprimus import file_analysis
+
+        target = self.root / "oversized.bin"
+        target.write_bytes(b"small")
+        with mock.patch.object(file_analysis, "ANALYSIS_MAX_FILE_BYTES", 4):
+            with self.assertRaisesRegex(ValueError, "size limit"):
+                analyze_file(target)
+
+    def test_png_reader_rejects_bytes_after_iend(self):
+        from obscuraprimus.png_codec import PngError, PngImage, read_png, write_png
+
+        target = self.root / "valid.png"
+        image = PngImage(1, 1, 8, 6, 0, 0, 0, b"\x10\x20\x30\xff", [], [])
+        write_png(image, target)
+        target.write_bytes(target.read_bytes() + b"trailing")
+        with self.assertRaisesRegex(PngError, "after IEND"):
+            read_png(target)
+
     def test_carving_compare_exif_strip_health_and_plugins(self):
         carrier = self.root / "carrier.bin"
         embedded_png = b"\x89PNG\r\n\x1a\npayloadIEND\xaeB`\x82"

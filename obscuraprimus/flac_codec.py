@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import struct
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-
 
 APPLICATION_BLOCK = 2
 OBP_APP_ID = b"OBP1"
@@ -52,7 +52,21 @@ def embed_container(input_path: str | Path, output_path: str | Path, container: 
     header = bytes([0x80 | APPLICATION_BLOCK]) + len(payload).to_bytes(3, "big")
     insertion = last.offset + 4 + last.length
     output = bytes(data[:insertion]) + header + payload + bytes(data[insertion:])
-    Path(output_path).write_bytes(output)
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(output)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, destination)
+    except Exception:
+        try:
+            os.unlink(temporary_name)
+        except OSError:
+            pass
+        raise
 
 
 def extract_container(path: str | Path) -> bytes:
