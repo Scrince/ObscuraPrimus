@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 import sys
 import traceback
-import logging
-import json
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRect, QThread, Qt, Signal
+from PySide6.QtCore import QObject, QRect, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QKeySequence, QPainter, QPen, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -18,14 +18,14 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
-    QPushButton,
-    QProgressBar,
     QPlainTextEdit,
-    QHeaderView,
+    QProgressBar,
+    QPushButton,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -33,7 +33,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import __version__
 from .advanced_analysis import (
+    analyze_path_isolated,
     anomaly_score,
     byte_histogram,
     deobfuscate_script,
@@ -52,15 +54,22 @@ from .advanced_analysis import (
 )
 from .case_db import dashboard as case_dashboard
 from .crypto import is_xchacha_available
-from . import __version__
-from .file_analysis import add_evidence, analyze_path, carve_embedded_files, compare_files, create_case, hex_preview, search_hex, sign_report, write_analysis_report
+from .file_analysis import (
+    add_evidence,
+    carve_embedded_files,
+    compare_files,
+    create_case,
+    hex_preview,
+    search_hex,
+    sign_report,
+    write_analysis_report,
+)
 from .forensics import scan_path, write_report
 from .health import check_github_update, portable_health
 from .jpeg_dct import backend_available as jpeg_backend_available
 from .plugins import available_plugins
 from .runtime import configure_logging, load_config, log_path, portable_data_dir, save_config
-from .stego_engine import EmbedOptions, StegoError, embed_file, estimate_capacity, estimate_distortion, extract_file
-
+from .stego_engine import EmbedOptions, embed_file, estimate_capacity, estimate_distortion, extract_file
 
 STYLE = """
 QWidget {
@@ -411,7 +420,7 @@ class AnalysisWorker(QObject):
 
     def run(self) -> None:
         try:
-            results = analyze_path(
+            results = analyze_path_isolated(
                 self.target,
                 recursive=self.recursive,
                 profile=self.profile,
@@ -443,11 +452,15 @@ class MainWindow(QMainWindow):
         self.config = load_config()
 
         tabs = QTabWidget()
-        tabs.addTab(self._build_embed_tab(), "Embed")
-        tabs.addTab(self._build_extract_tab(), "Extract")
-        tabs.addTab(self._build_forensic_tab(), "Forensics")
-        tabs.addTab(self._build_analysis_tab(), "Analysis")
-        tabs.addTab(self._build_suite_tab(), "Suite")
+        self.tabs = tabs
+        ui_mode = str(self.config.get("ui_mode", "full"))
+        if ui_mode in {"stego", "full"}:
+            tabs.addTab(self._build_embed_tab(), "Embed")
+            tabs.addTab(self._build_extract_tab(), "Extract")
+        if ui_mode in {"forensics", "full"}:
+            tabs.addTab(self._build_forensic_tab(), "Forensics")
+            tabs.addTab(self._build_analysis_tab(), "Analysis")
+            tabs.addTab(self._build_suite_tab(), "Suite")
         tabs.addTab(self._build_settings_tab(), "Settings")
         self.setCentralWidget(tabs)
         self._install_shortcuts()
@@ -521,7 +534,7 @@ class MainWindow(QMainWindow):
         options.addRow(self.password_strength_label)
         options.addRow("Security", self.security_summary_label)
 
-        self.capacity_label = QLabel("Capacity: choose a cover file to estimate usable payload.")
+        self.capacity_label = QLabel("Estimated capacity: choose a cover file to estimate usable payload.")
         self.cover_input.textChanged.connect(self._update_capacity)
         self.secret_input.textChanged.connect(self._update_capacity)
         self.adaptive_check.stateChanged.connect(self._update_capacity)
@@ -686,10 +699,21 @@ class MainWindow(QMainWindow):
         self.default_spread_check.setChecked(bool(self.config.get("default_spread", False)))
         self.high_contrast_check = QCheckBox("High contrast theme")
         self.high_contrast_check.setChecked(self.config.get("theme") == "high_contrast")
+        self.allow_network_check = QCheckBox("Allow network update checks (offline by default)")
+        self.allow_network_check.setChecked(bool(self.config.get("allow_network_updates", False)))
+        self.ui_mode_combo = QComboBox()
+        self.ui_mode_combo.addItem("Full (stego + forensics)", "full")
+        self.ui_mode_combo.addItem("Stego only (embed/extract)", "stego")
+        self.ui_mode_combo.addItem("Forensics suite only", "forensics")
+        current_mode = str(self.config.get("ui_mode", "full"))
+        idx = max(0, self.ui_mode_combo.findData(current_mode))
+        self.ui_mode_combo.setCurrentIndex(idx)
         defaults.addRow(self.default_compress_check)
         defaults.addRow(self.default_adaptive_check)
         defaults.addRow(self.default_spread_check)
         defaults.addRow(self.high_contrast_check)
+        defaults.addRow(self.allow_network_check)
+        defaults.addRow("UI focus mode", self.ui_mode_combo)
 
         save_button = QPushButton("Save Settings")
         save_button.clicked.connect(self._save_settings)
@@ -710,8 +734,10 @@ class MainWindow(QMainWindow):
             "ObscuraPrimus 1.0.0\n"
             "Release signing fingerprint:\n"
             "323D 123C BF92 E8C9 62AA A846 3B4C CEFE CA58 0B4D\n\n"
-            "Supported carriers: BMP, PNG, WAV, FLAC.\n"
-            "JPEG-DCT requires OBSCURAPRIMUS_JPEG_DCT_BACKEND."
+            "Supported production carriers: BMP, PNG, WAV, FLAC.\n"
+            "JPEG-DCT is experimental: requires OBSCURAPRIMUS_JPEG_DCT_BACKEND; "
+            "not offered as a default carrier.\n"
+            "Network update checks are disabled unless you opt in below."
         )
 
         buttons = QHBoxLayout()
@@ -1111,6 +1137,19 @@ class MainWindow(QMainWindow):
             )
             if proceed != QMessageBox.Yes:
                 return
+        stego_key = self.stego_key_input.text()
+        if (self.adaptive_check.isChecked() or self.spread_check.isChecked()) and not stego_key and (
+            algorithm == "None" or not password
+        ):
+            proceed = QMessageBox.question(
+                self,
+                "ObscuraPrimus",
+                "Adaptive/spread without a password or stego key does not keep carrier order secret. Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if proceed != QMessageBox.Yes:
+                return
 
         kwargs = {
             "cover_path": cover,
@@ -1123,7 +1162,7 @@ class MainWindow(QMainWindow):
                 adaptive=self.adaptive_check.isChecked(),
                 spread=self.spread_check.isChecked(),
                 verify_after_embed=self.verify_check.isChecked(),
-                stego_key=self.stego_key_input.text(),
+                stego_key=stego_key,
                 kdf=self.kdf_combo.currentText(),
                 density=self.density_combo.currentText(),
             ),
@@ -1420,7 +1459,7 @@ class MainWindow(QMainWindow):
     def _update_capacity(self) -> None:
         cover = self.cover_input.text().strip()
         if not Path(cover).is_file():
-            self.capacity_label.setText("Capacity: choose a cover file to estimate usable payload.")
+            self.capacity_label.setText("Estimated capacity: choose a cover file to estimate usable payload.")
             self.distortion_label.setText("Distortion estimate: choose cover and secret files.")
             return
         try:
@@ -1430,19 +1469,26 @@ class MainWindow(QMainWindow):
                 self.spread_check.isChecked(),
                 self.density_combo.currentText(),
             )
-            self.capacity_label.setText(f"Capacity: exactly {capacity:,} payload bytes before compression/encryption overhead.")
+            self.capacity_label.setText(f"Estimated usable capacity: up to {capacity:,} payload bytes before compression/encryption overhead.")
             secret = self.secret_input.text().strip()
             if Path(secret).is_file():
                 payload_size = Path(secret).stat().st_size
-                estimate = estimate_distortion(cover, payload_size, self.adaptive_check.isChecked(), self.density_combo.currentText())
+                estimate = estimate_distortion(
+                    cover,
+                    payload_size,
+                    self.adaptive_check.isChecked(),
+                    self.density_combo.currentText(),
+                    self.spread_check.isChecked(),
+                )
                 ratio = estimate["estimated_change_ratio"] * 100
                 self.distortion_label.setText(
-                    f"Distortion estimate: up to {estimate['estimated_lsb_changes']:,} LSB flips, about {ratio:.4f}% carrier change."
+                    f"Heuristic distortion estimate: about {estimate['estimated_lsb_changes']:,} LSB flips, "
+                    f"roughly {ratio:.4f}% of estimated carriers. Actual changes vary with payload and options."
                 )
             else:
                 self.distortion_label.setText("Distortion estimate: choose a secret file.")
         except Exception as exc:
-            self.capacity_label.setText(f"Capacity: unavailable ({exc}).")
+            self.capacity_label.setText(f"Estimated capacity: unavailable ({exc}).")
             self.distortion_label.setText("Distortion estimate: unavailable.")
 
     def _warn(self, message: str) -> None:
@@ -1457,9 +1503,12 @@ class MainWindow(QMainWindow):
         self.config["default_adaptive"] = self.default_adaptive_check.isChecked()
         self.config["default_spread"] = self.default_spread_check.isChecked()
         self.config["theme"] = "high_contrast" if self.high_contrast_check.isChecked() else "dark"
+        self.config["allow_network_updates"] = self.allow_network_check.isChecked()
+        mode = self.ui_mode_combo.currentData()
+        self.config["ui_mode"] = mode if mode in {"stego", "forensics", "full"} else "full"
         save_config(self.config)
         QApplication.instance().setStyleSheet(HIGH_CONTRAST_STYLE if self.config["theme"] == "high_contrast" else STYLE)
-        self._warn("Settings saved.")
+        self._warn("Settings saved. Restart the app for UI focus mode changes to take effect.")
 
     def _open_folder(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
@@ -1476,6 +1525,14 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Analyzer Plugins", text)
 
     def _check_updates(self) -> None:
+        if not self.config.get("allow_network_updates", False):
+            QMessageBox.information(
+                self,
+                "Update Check",
+                "Network update checks are disabled (portable offline default).\n"
+                "Enable 'Allow network update checks' in Settings and save, then try again.",
+            )
+            return
         result = check_github_update(self.config.get("update_repo", ""), __version__)
         QMessageBox.information(self, "Update Check", json.dumps(result, indent=2))
 
@@ -1559,6 +1616,10 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
+    from .advanced_analysis import maybe_run_analyze_worker
+
+    if maybe_run_analyze_worker():
+        return 0
     log_file = configure_logging()
     logging.info("Starting ObscuraPrimus; log file: %s", log_file)
     app = QApplication(sys.argv)

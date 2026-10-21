@@ -5,8 +5,9 @@ import zlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+MAX_DIMENSION = 16_384
+MAX_INFLATED_BYTES = 256 * 1024 * 1024
 
 
 class PngError(ValueError):
@@ -26,7 +27,7 @@ class PngImage:
     chunks_before_idat: list[tuple[bytes, bytes]]
     chunks_after_idat: list[tuple[bytes, bytes]]
 
-    def with_pixels(self, pixels: bytes) -> "PngImage":
+    def with_pixels(self, pixels: bytes) -> PngImage:
         return replace(self, pixels=pixels)
 
 
@@ -41,8 +42,14 @@ def read_png(path: str | Path) -> PngImage:
     before: list[tuple[bytes, bytes]] = []
     after: list[tuple[bytes, bytes]] = []
     seen_idat = False
+    idat_ended = False
+    seen_iend = False
+    chunk_count = 0
 
     while offset < len(raw):
+        chunk_count += 1
+        if chunk_count > 100_000:
+            raise PngError("PNG has too many chunks.")
         if offset + 8 > len(raw):
             raise PngError("PNG chunk table is truncated.")
         length = struct.unpack(">I", raw[offset : offset + 4])[0]
@@ -59,24 +66,35 @@ def read_png(path: str | Path) -> PngImage:
             raise PngError(f"PNG chunk {chunk_type.decode('latin1')} has an invalid CRC.")
 
         if chunk_type == b"IHDR":
+            if ihdr is not None or offset != len(PNG_SIGNATURE) or length != 13:
+                raise PngError("PNG must start with one 13-byte IHDR chunk.")
             ihdr = data
             before.append((chunk_type, data))
         elif chunk_type == b"IDAT":
+            if idat_ended:
+                raise PngError("PNG IDAT chunks must be consecutive.")
             seen_idat = True
             idat_parts.append(data)
         elif chunk_type == b"IEND":
+            if length != 0 or not seen_idat:
+                raise PngError("PNG IEND chunk is invalid or appears before image data.")
             after.append((chunk_type, data))
+            seen_iend = True
+            offset = crc_end
             break
         elif seen_idat:
+            idat_ended = True
             after.append((chunk_type, data))
         else:
             before.append((chunk_type, data))
         offset = crc_end
 
-    if ihdr is None or not idat_parts:
-        raise PngError("PNG is missing IHDR or IDAT data.")
+    if ihdr is None or not idat_parts or not seen_iend or offset != len(raw):
+        raise PngError("PNG is missing required chunks or has data after IEND.")
 
     width, height, bit_depth, color_type, compression, filter_method, interlace = struct.unpack(">IIBBBBB", ihdr)
+    if width <= 0 or height <= 0 or width > MAX_DIMENSION or height > MAX_DIMENSION:
+        raise PngError("PNG dimensions are unsupported or excessive.")
     if bit_depth != 8 or color_type not in {0, 2, 4, 6}:
         raise PngError("PNG support is limited to 8-bit grayscale, RGB, grayscale-alpha, or RGBA images.")
     if compression != 0 or filter_method != 0 or interlace != 0:
@@ -84,8 +102,11 @@ def read_png(path: str | Path) -> PngImage:
 
     channels = _channels_for_color_type(color_type)
     stride = width * channels
-    inflated = zlib.decompress(b"".join(idat_parts))
     expected = height * (stride + 1)
+    if expected > MAX_INFLATED_BYTES:
+        raise PngError("PNG inflated image data exceeds the safe size limit.")
+
+    inflated = _safe_inflate(b"".join(idat_parts), expected)
     if len(inflated) != expected:
         raise PngError("PNG image data has an unexpected size.")
 
@@ -117,6 +138,24 @@ def write_png(image: PngImage, path: str | Path) -> None:
     if not any(chunk_type == b"IEND" for chunk_type, _ in image.chunks_after_idat):
         output.extend(_chunk(b"IEND", b""))
     Path(path).write_bytes(output)
+
+
+def _safe_inflate(data: bytes, expected: int) -> bytes:
+    decompressor = zlib.decompressobj()
+    try:
+        output = decompressor.decompress(data, max_length=expected + 1)
+    except zlib.error as exc:
+        raise PngError(f"PNG decompression failed: {exc}") from exc
+    if len(output) > expected:
+        raise PngError("PNG inflated image data exceeds the declared size (possible zip bomb).")
+    if decompressor.unconsumed_tail or not decompressor.eof:
+        try:
+            extra = decompressor.decompress(b"", max_length=1)
+        except zlib.error:
+            extra = b""
+        if extra or decompressor.unconsumed_tail or not decompressor.eof:
+            raise PngError("PNG inflated image data exceeds the declared size (possible zip bomb).")
+    return output
 
 
 def _unfilter_scanlines(data: bytes, width: int, height: int, channels: int) -> bytes:

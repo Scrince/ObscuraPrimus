@@ -10,7 +10,6 @@ import os
 import re
 import shutil
 import sqlite3
-import struct
 import subprocess
 import tarfile
 import time
@@ -21,7 +20,6 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .flac_codec import FlacCodecError, inspect_flac
-
 
 MAGIC_SIGNATURES: tuple[tuple[bytes, str], ...] = (
     (b"\x89PNG\r\n\x1a\n", "PNG image"),
@@ -57,6 +55,8 @@ EXTENSION_HINTS = {
 SCRIPT_EXTENSIONS = {".ps1", ".bat", ".cmd", ".js", ".vbs", ".py"}
 CHUNK_SIZE = 1024 * 1024
 ANALYSIS_FULL_READ_LIMIT = 64 * CHUNK_SIZE
+ANALYSIS_MAX_FILE_BYTES = 512 * CHUNK_SIZE
+ANALYSIS_TIMEOUT_SECONDS = 45
 CARVE_SIGNATURES: tuple[tuple[bytes, bytes, str], ...] = (
     (b"\x89PNG\r\n\x1a\n", b"IEND\xaeB`\x82", "png"),
     (b"\xff\xd8\xff", b"\xff\xd9", "jpg"),
@@ -68,7 +68,10 @@ IOC_PATTERNS = {
     "urls": re.compile(rb"https?://[^\s'\"<>]+", re.I),
     "emails": re.compile(rb"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I),
     "ips": re.compile(rb"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b"),
-    "domains": re.compile(rb"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:com|net|org|io|ru|cn|info|biz)\b", re.I),
+    "domains": re.compile(
+        rb"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63})\b",
+        re.I,
+    ),
     "wallets": re.compile(rb"\b(?:bc1[ac-hj-np-z02-9]{25,90}|[13][a-km-zA-HJ-NP-Z1-9]{25,34}|0x[a-fA-F0-9]{40})\b"),
 }
 
@@ -104,6 +107,8 @@ class FileAnalysis:
 def analyze_file(path: str | Path, deep: bool = True, yara_rules: str = "") -> FileAnalysis:
     file_path = Path(path)
     stat = file_path.stat()
+    if stat.st_size > ANALYSIS_MAX_FILE_BYTES:
+        raise ValueError(f"File exceeds analysis size limit: {stat.st_size:,} bytes > {ANALYSIS_MAX_FILE_BYTES // CHUNK_SIZE} MiB.")
     data = _read_analysis_bytes(file_path, stat.st_size)
     sampled = stat.st_size > len(data)
     magic_type = identify_magic(data)
@@ -175,15 +180,13 @@ def analyze_path(
 ) -> list[FileAnalysis]:
     path = Path(target)
     deep = profile != "quick"
-    files = [path] if path.is_file() else [p for p in (path.rglob("*") if recursive else path.glob("*")) if p.is_file()]
     results: list[FileAnalysis] = []
     seen_hashes: dict[str, str] = {}
-    total = max(1, len(files))
-    for index, file_path in enumerate(files, start=1):
+    for index, file_path in enumerate(_iter_scan_files(path, recursive), start=1):
         if cancel and cancel():
             break
         try:
-            analysis = analyze_file(file_path, deep=deep, yara_rules=yara_rules)
+            analysis = _analyze_file_limited(file_path, deep, yara_rules)
             digest = analysis.hashes["sha256"]
             if digest in seen_hashes:
                 analysis.duplicate_of = seen_hashes[digest]
@@ -194,8 +197,29 @@ def analyze_path(
         except Exception as exc:
             results.append(error_analysis(file_path, exc))
         if progress:
-            progress(int(index * 100 / total), str(file_path))
+            progress(min(99, index), str(file_path))
+    if progress:
+        progress(100, str(path))
     return results
+
+
+def _iter_scan_files(path: Path, recursive: bool):
+    if path.is_file():
+        yield path
+        return
+    iterator = path.rglob("*") if recursive else path.glob("*")
+    for candidate in iterator:
+        try:
+            if candidate.is_file():
+                yield candidate
+        except OSError:
+            continue
+
+
+def _analyze_file_limited(path: Path, deep: bool, yara_rules: str) -> FileAnalysis:
+    from .advanced_analysis import _analyze_file_process
+
+    return _analyze_file_process(path, deep, yara_rules, ANALYSIS_TIMEOUT_SECONDS)
 
 
 def _read_analysis_bytes(path: Path, size: int) -> bytes:
@@ -355,7 +379,7 @@ def compare_files(left: str | Path, right: str | Path, max_diffs: int = 1000) ->
             right_chunk = right_handle.read(CHUNK_SIZE)
             if not left_chunk or not right_chunk:
                 break
-            for index, (left_byte, right_byte) in enumerate(zip(left_chunk, right_chunk)):
+            for index, (left_byte, right_byte) in enumerate(zip(left_chunk, right_chunk, strict=False)):
                 if left_byte != right_byte:
                     diffs.append({"offset": offset + index, "left": left_byte, "right": right_byte})
                     if len(diffs) >= max_diffs:
@@ -421,12 +445,19 @@ def inspect_container(path: Path, data: bytes) -> dict:
     try:
         if zipfile.is_zipfile(path):
             with zipfile.ZipFile(path) as archive:
-                entries = [{"name": info.filename, "size": info.file_size, "compressed": info.compress_size} for info in archive.infolist()[:500]]
-                embedded = [info.filename for info in archive.infolist() if re.search(r"\.(exe|dll|js|vbs|ps1|bin|ole|pdf)$", info.filename, re.I)]
-            return {"type": "zip", "entries": entries, "entry_count": len(entries), "embedded_candidates": embedded[:100]}
+                members = archive.infolist()
+                if len(members) > 10_000:
+                    return {"type": "zip", "error": "Archive exceeds the 10,000 member inspection limit.", "entry_count": len(members)}
+                if sum(info.file_size for info in members) > 2 * 1024 * 1024 * 1024:
+                    return {"type": "zip", "error": "Archive exceeds the 2 GiB expanded-size inspection limit.", "entry_count": len(members)}
+                entries = [{"name": info.filename, "size": info.file_size, "compressed": info.compress_size} for info in members[:500]]
+                embedded = [info.filename for info in members if re.search(r"\.(exe|dll|js|vbs|ps1|bin|ole|pdf)$", info.filename, re.I)]
+            return {"type": "zip", "entries": entries, "entry_count": len(members), "embedded_candidates": embedded[:100]}
         if suffix in {".tar", ".tgz"} and tarfile.is_tarfile(path):
             with tarfile.open(path) as archive:
                 members = archive.getmembers()
+            if len(members) > 10_000 or sum(max(0, member.size) for member in members) > 2 * 1024 * 1024 * 1024:
+                return {"type": "tar", "error": "Archive exceeds inspection member or expanded-size limits.", "entry_count": len(members)}
             return {"type": "tar", "entries": [{"name": m.name, "size": m.size} for m in members[:500]], "entry_count": len(members)}
         if data.startswith(b"\x1f\x8b"):
             with gzip.open(path, "rb") as handle:
@@ -560,12 +591,19 @@ def office_metadata(path: Path) -> dict:
     external_links = []
     embedded = []
     with zipfile.ZipFile(path) as archive:
-        names = archive.namelist()
-        for name in names:
+        members = archive.infolist()
+        if len(members) > 10_000 or sum(info.file_size for info in members) > 2 * 1024 * 1024 * 1024:
+            return {"office_container": True, "inspection_limited": True, "entry_count": len(members)}
+        names = [info.filename for info in members]
+        for info in members:
+            name = info.filename
             lower = name.lower()
             if lower.endswith(".rels"):
                 try:
-                    text = archive.read(name).decode("utf-8", errors="ignore")
+                    with archive.open(info) as handle:
+                        text = handle.read(2 * 1024 * 1024 + 1).decode("utf-8", errors="ignore")
+                    if len(text) > 2 * 1024 * 1024:
+                        continue
                     relationships.append({"name": name, "external": "TargetMode=\"External\"" in text})
                     external_links.extend(re.findall(r'Target="([^"]+)"[^>]+TargetMode="External"', text))
                 except Exception:
@@ -685,18 +723,21 @@ def run_clamav(path: Path) -> str:
     return result.stdout.strip()
 
 
-def virustotal_lookup(sha256: str, api_key: str) -> dict:
-    if not api_key:
-        return {}
+def virustotal_lookup(sha256: str, api_key: str = "") -> dict:
+    key = (api_key or os.environ.get("OBSCURAPRIMUS_VT_API_KEY") or os.environ.get("VT_API_KEY") or "").strip()
+    if not key:
+        return {"error": "No VirusTotal API key. Set OBSCURAPRIMUS_VT_API_KEY or pass --api-key."}
+    if not re.fullmatch(r"[a-fA-F0-9]{64}", sha256 or ""):
+        return {"error": "sha256 must be a 64-character hex digest."}
     request = urllib.request.Request(
         f"https://www.virustotal.com/api/v3/files/{sha256}",
-        headers={"x-apikey": api_key},
+        headers={"x-apikey": key},
     )
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             return json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-        return {}
+        return {"error": "VirusTotal lookup failed."}
 
 
 def load_hash_set(path: str | Path) -> set[str]:
@@ -721,8 +762,11 @@ def classify_hashes(results: list[FileAnalysis], known_good: set[str] | None = N
             item.suspicious.append("Known-good hash match.")
 
 
-def carve_embedded_files(path: str | Path, output_dir: str | Path, max_items: int = 50) -> list[dict]:
-    data = Path(path).read_bytes()
+def carve_embedded_files(path: str | Path, output_dir: str | Path, max_items: int = 50, max_read_bytes: int = 64 * 1024 * 1024) -> list[dict]:
+    file_path = Path(path)
+    size = file_path.stat().st_size
+    with file_path.open("rb") as handle:
+        data = handle.read(min(size, max_read_bytes))
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     carved = []
@@ -742,6 +786,16 @@ def carve_embedded_files(path: str | Path, output_dir: str | Path, max_items: in
             (output / name).write_bytes(blob)
             carved.append({"offset": found, "size": len(blob), "type": extension, "path": str(output / name)})
             start = end
+    if size > max_read_bytes:
+        carved.append(
+            {
+                "offset": 0,
+                "size": 0,
+                "type": "note",
+                "path": "",
+                "note": f"Only the first {max_read_bytes:,} of {size:,} bytes were scanned for carving.",
+            }
+        )
     return carved
 
 
